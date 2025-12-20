@@ -35,6 +35,7 @@ struct netpoll {
 
 	DEEPIN_KABI_RESERVE(1)
 	DEEPIN_KABI_RESERVE(2)
+	DEEPIN_KABI_EXTEND(struct sk_buff_head skb_pool)
 };
 
 struct netpoll_info {

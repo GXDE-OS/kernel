@@ -145,10 +145,21 @@ struct hw_perf_event_extra {
  * PERF_EVENT_FLAG_ARCH bits are reserved for architecture-specific
  * usage.
  */
-#define PERF_EVENT_FLAG_ARCH			0x000fffff
+#define PERF_EVENT_FLAG_ARCH			0x0fffffff
 #define PERF_EVENT_FLAG_USER_READ_CNT		0x80000000
 
 static_assert((PERF_EVENT_FLAG_USER_READ_CNT & PERF_EVENT_FLAG_ARCH) == 0);
+
+struct hw_perf_event_ext {
+#ifdef CONFIG_PERF_EVENTS
+	union {
+		struct {
+			u64 config1;
+			u64 dyn_constraint;
+		};
+	};
+#endif
+};
 
 /**
  * struct hw_perf_event - performance event hardware details:
@@ -852,7 +863,7 @@ struct perf_event {
 	 */
 	__u32				orig_type;
 
-	DEEPIN_KABI_RESERVE(1)
+	DEEPIN_KABI_USE(1, struct hw_perf_event_ext *hw_ext)
 	DEEPIN_KABI_RESERVE(2)
 	DEEPIN_KABI_RESERVE(3)
 	DEEPIN_KABI_RESERVE(4)
