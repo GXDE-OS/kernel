@@ -13,7 +13,7 @@
 #ifndef CS42L43_CORE_INT_H
 #define CS42L43_CORE_INT_H
 
-#define CS42L43_N_DEFAULTS 176
+#define CS42L43_N_DEFAULTS 189
 
 extern const struct dev_pm_ops cs42l43_pm_ops;
 extern const struct reg_default cs42l43_reg_default[CS42L43_N_DEFAULTS];
