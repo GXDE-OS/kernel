@@ -640,7 +640,7 @@ static int macb_usx_pcs_config(struct phylink_pcs *pcs,
 	struct macb *bp = container_of(pcs, struct macb, phylink_usx_pcs);
 
 	gem_writel(bp, USX_CONTROL, gem_readl(bp, USX_CONTROL) |
-		   GEM_BIT(SIGNAL_OK));
+		   GEM_BIT(SIGNAL_OK) | GEM_BIT(TX_EN));
 
 	return 0;
 }
@@ -926,7 +926,6 @@ static void phytium_gem1p0_sel_clk(struct macb *bp, int speed)
 							gem_readl(bp, HS_MAC_CONFIG)));
 }
 
-#if defined(CONFIG_OF)
 static void phytium_gem2p0_sel_clk(struct macb *bp, int speed)
 {
 	if (bp->phy_interface == PHY_INTERFACE_MODE_SGMII) {
@@ -946,7 +945,6 @@ static void phytium_gem2p0_sel_clk(struct macb *bp, int speed)
 		gem_writel(bp, HS_MAC_CONFIG, GEM_BFINS(HS_MAC_SPEED, HS_SPEED_2500M,
 							gem_readl(bp, HS_MAC_CONFIG)));
 }
-#endif /* CONFIG_OF */
 
 static void macb_mac_link_up(struct phylink_config *config,
 			     struct phy_device *phy,
@@ -991,14 +989,12 @@ static void macb_mac_link_up(struct phylink_config *config,
 
 		macb_set_tx_clk(bp, speed);
 
-		/* Initialize rings & buffers as clearing MACB_BIT(TE) in link down
-		 * cleared the pipeline and control registers.
-		 */
-		macb_init_buffers(bp);
-
-		for (q = 0, queue = bp->queues; q < bp->num_queues; ++q, ++queue)
+		for (q = 0, queue = bp->queues; q < bp->num_queues; ++q, ++queue) {
+			queue->tx_head = 0;
+			queue->tx_tail = 0;
 			queue_writel(queue, IER,
 				     bp->rx_intr_mask | MACB_TX_INT_FLAGS | MACB_BIT(HRESP));
+		}
 	}
 
 	macb_or_gem_writel(bp, NCFGR, ctrl);
@@ -2013,7 +2009,8 @@ static void macb_tx_restart(struct macb_queue *queue)
 	if (queue->tx_head == queue->tx_tail)
 		goto out_tx_ptr_unlock;
 
-	tbqp = queue_readl(queue, TBQP) / macb_dma_desc_get_size(bp);
+	tbqp = queue_readl(queue, TBQP) - lower_32_bits(queue->tx_ring_dma);
+	tbqp = tbqp / macb_dma_desc_get_size(bp);
 	tbqp = macb_adj_dma_desc_idx(bp, macb_tx_ring_wrap(bp, tbqp));
 	head_idx = macb_adj_dma_desc_idx(bp, macb_tx_ring_wrap(bp, queue->tx_head));
 
@@ -3406,6 +3403,7 @@ static int macb_open(struct net_device *dev)
 	}
 
 	bp->macbgem_ops.mog_init_rings(bp);
+	macb_init_buffers(bp);
 
 	for (q = 0, queue = bp->queues; q < bp->num_queues; ++q, ++queue) {
 		napi_enable(&queue->napi_rx);
@@ -4787,7 +4785,6 @@ static const struct macb_config phytium_gem1p0_config = {
 	.usrio = &macb_default_usrio,
 };
 
-#if defined(CONFIG_OF)
 /* 1518 rounded up */
 #define AT91ETHER_MAX_RBUFF_SZ	0x600
 /* max number of receive buffers */
@@ -5490,6 +5487,7 @@ static const struct macb_config phytium_gem2p0_config = {
 	.usrio = &macb_default_usrio,
 };
 
+#if defined(CONFIG_OF)
 static const struct of_device_id macb_dt_ids[] = {
 	{ .compatible = "cdns,at91sam9260-macb", .data = &at91sam9260_config },
 	{ .compatible = "cdns,macb" },

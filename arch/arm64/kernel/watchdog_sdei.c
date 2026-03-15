@@ -25,6 +25,7 @@ static int sdei_watchdog_event_num;
 bool disable_sdei_nmi_watchdog;
 static bool sdei_watchdog_registered;
 static DEFINE_PER_CPU(ktime_t, last_check_time);
+static DEFINE_PER_CPU(bool, sdei_usr_en);
 
 void sdei_watchdog_hardlockup_enable(unsigned int cpu)
 {
@@ -44,6 +45,7 @@ void sdei_watchdog_hardlockup_enable(unsigned int cpu)
 		pr_err("Enable NMI Watchdog failed on cpu%d\n",
 				smp_processor_id());
 	}
+	__this_cpu_write(sdei_usr_en, 1);
 }
 
 void sdei_watchdog_hardlockup_disable(unsigned int cpu)
@@ -54,6 +56,7 @@ void sdei_watchdog_hardlockup_disable(unsigned int cpu)
 		return;
 
 	ret = sdei_api_event_disable(sdei_watchdog_event_num);
+	__this_cpu_write(sdei_usr_en, 0);
 	if (ret)
 		pr_err("Disable NMI Watchdog failed on cpu%d\n",
 				smp_processor_id());
@@ -65,7 +68,6 @@ static int sdei_watchdog_callback(u32 event,
 	ktime_t delta, now = ktime_get_mono_fast_ns();
 
 	delta = now - __this_cpu_read(last_check_time);
-	__this_cpu_write(last_check_time, now);
 
 	/*
 	 * Set delta to 4/5 of the actual watchdog threshold period so the
@@ -79,6 +81,7 @@ static int sdei_watchdog_callback(u32 event,
 	}
 
 	watchdog_hardlockup_check(smp_processor_id(), regs);
+	__this_cpu_write(last_check_time, now);
 
 	return 0;
 }
@@ -110,24 +113,46 @@ void sdei_watchdog_clear_eoi(void)
 static int sdei_watchdog_pm_notifier(struct notifier_block *nb,
 				unsigned long action, void *data)
 {
-	int rv;
+	int rv = 0;
+	u64 result;
 
 	WARN_ON_ONCE(preemptible());
 
+	/*
+	 * Judge event status before disable or enable to prevent
+	 * incorrect state transitions, e.g., disabling after
+	 * unregistering.
+	 */
+	rv = sdei_api_event_status(sdei_watchdog_event_num, &result);
+	if (rv)
+		goto error;
+	if (!result)
+		goto success;
+
+	/*
+	 * After powering on/off the LPI (Low Power Idle),
+	 * the enable function must be called to enable the
+	 * EL3 Secure Timer, ensuring proper handling of
+	 * secure timer functionality.
+	 */
 	switch (action) {
 	case CPU_PM_ENTER:
-		rv = sdei_api_event_disable(sdei_watchdog_event_num);
+		if (per_cpu(sdei_usr_en, smp_processor_id()))
+			rv = sdei_api_event_disable(sdei_watchdog_event_num);
 		break;
 	case CPU_PM_EXIT:
-		rv = sdei_api_event_enable(sdei_watchdog_event_num);
+	case CPU_PM_ENTER_FAILED:
+		if (per_cpu(sdei_usr_en, smp_processor_id()))
+			rv = sdei_api_event_enable(sdei_watchdog_event_num);
 		break;
 	default:
 		return NOTIFY_DONE;
 	}
 
+error:
 	if (rv)
 		return notifier_from_errno(rv);
-
+success:
 	return NOTIFY_OK;
 }
 

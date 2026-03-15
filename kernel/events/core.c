@@ -425,7 +425,6 @@ static DEFINE_MUTEX(pmus_lock);
 static struct srcu_struct pmus_srcu;
 static cpumask_var_t perf_online_mask;
 static struct kmem_cache *perf_event_cache;
-static struct kmem_cache *perf_hw_event_cache;
 
 /*
  * perf event paranoia level:
@@ -5013,7 +5012,6 @@ static void free_event_rcu(struct rcu_head *head)
 	if (event->ns)
 		put_pid_ns(event->ns);
 	perf_event_free_filter(event);
-	kmem_cache_free(perf_hw_event_cache, event->hw_ext);
 	kmem_cache_free(perf_event_cache, event);
 }
 
@@ -6987,7 +6985,7 @@ static void perf_sample_regs_user(struct perf_regs *regs_user,
 	if (user_mode(regs)) {
 		regs_user->abi = perf_reg_abi(current);
 		regs_user->regs = regs;
-	} else if (!(current->flags & (PF_KTHREAD | PF_USER_WORKER))) {
+	} else if (is_user_task(current)) {
 		perf_get_regs_user(regs_user, regs);
 	} else {
 		regs_user->abi = PERF_SAMPLE_REGS_ABI_NONE;
@@ -7622,7 +7620,7 @@ static u64 perf_virt_to_phys(u64 virt)
 		 * Try IRQ-safe get_user_page_fast_only first.
 		 * If failed, leave phys_addr as 0.
 		 */
-		if (!(current->flags & (PF_KTHREAD | PF_USER_WORKER))) {
+		if (is_user_task(current)) {
 			struct page *p;
 
 			pagefault_disable();
@@ -7735,7 +7733,7 @@ perf_callchain(struct perf_event *event, struct pt_regs *regs)
 {
 	bool kernel = !event->attr.exclude_callchain_kernel;
 	bool user   = !event->attr.exclude_callchain_user &&
-		!(current->flags & (PF_KTHREAD | PF_USER_WORKER));
+		is_user_task(current);
 	/* Disallow cross-task user callchains. */
 	bool crosstask = event->ctx->task && event->ctx->task != current;
 	const u32 max_stack = event->attr.sample_max_stack;
@@ -12069,14 +12067,6 @@ perf_event_alloc(struct perf_event_attr *attr, int cpu,
 	if (!event)
 		return ERR_PTR(-ENOMEM);
 
-	event->hw_ext = kmem_cache_alloc_node(perf_hw_event_cache,
-					      GFP_KERNEL | __GFP_ZERO,
-					      node);
-	if (!event->hw_ext) {
-		kmem_cache_free(perf_event_cache, event);
-		return ERR_PTR(-ENOMEM);
-	}
-
 	/*
 	 * Single events are their own group leaders, with an
 	 * empty sibling list:
@@ -13939,7 +13929,6 @@ void __init perf_event_init(void)
 	WARN(ret, "hw_breakpoint initialization failed with: %d", ret);
 
 	perf_event_cache = KMEM_CACHE(perf_event, SLAB_PANIC);
-	perf_hw_event_cache = KMEM_CACHE(hw_perf_event_ext, SLAB_PANIC);
 
 	/*
 	 * Build time assertion that we keep the data_head at the intended
