@@ -1077,7 +1077,7 @@ struct rq {
 	 * one CPU and if it got migrated afterwards it may decrease
 	 * it on another CPU. Always updated under the runqueue lock:
 	 */
-	unsigned long 		nr_uninterruptible;
+	unsigned long		nr_uninterruptible;
 
 	struct task_struct __rcu	*curr;
 	struct task_struct	*idle;
@@ -3388,7 +3388,7 @@ static inline bool uclamp_rq_is_idle(struct rq *rq)
 
 static inline unsigned long cpu_util_irq(struct rq *rq)
 {
-	return rq->avg_irq.util_avg;
+	return READ_ONCE(rq->avg_irq.util_avg);
 }
 
 static inline
