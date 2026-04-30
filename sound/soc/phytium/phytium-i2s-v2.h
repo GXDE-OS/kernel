@@ -2,7 +2,7 @@
  *
  * Phytium I2S ASoC driver
  *
- * Copyright (C) 2024, Phytium Technology Co., Ltd.
+ * Copyright (C) 2023-2024, Phytium Technology Co., Ltd.
  *
  */
 
@@ -32,11 +32,7 @@ struct phytium_i2s {
 	struct snd_pcm_substream *substream_capture;
 	u32 clk_base;
 	struct phytium_pcm_config pcm_config[2];
-	struct delayed_work i2s_playback_stop_work;
-	struct delayed_work i2s_capture_stop_work;
 	struct delayed_work phyt_i2s_gpio_work;
-	struct phyti2s_cmd *msg;
-	int interrupt;
 	int running;
 	struct timer_list timer;
 	bool heart_enable;
@@ -44,7 +40,10 @@ struct phytium_i2s {
 	uint32_t data_width;
 	uint32_t sample_rate;
 	int insert;
-	struct mutex sharemem_mutex;
+	int gpio_irq;
+	bool i2s_dp;
+	void __iomem *log_addr;
+	u32 log_size;
 };
 
 struct pdata_pd230x_mfd {
@@ -137,11 +136,30 @@ struct phyti2s_cmd {
 #define PHYTIUM_REGFILE_AP2RV_INT_MASK	0x20
 #define PHYTIUM_REGFILE_AP2RV_INT_STATE	0x24
 	#define SEND_INTR		(1 << 4)
+	#define SEND_GPIO_INTR		(1 << 8)
 #define PHYTIUM_REGFILE_GPIO_PORTA_EOI		0x30
 #define PHYTIUM_REGFILE_DEBUG			0x58
 	#define DEBUG_ENABLE	(1 << 0)
 	#define HEART_ENABLE	(1 << 1)
 	#define HEARTBEAT		(1 << 2)
+	#define LOG_MASK		(1 << 3)
+	#define LOG_SIZE_LOW_SHIFT	4
+	#define LOG_SIZE_MASK			GENMASK(7, 4)
+	#define LOG_SIZE_MAX		8192
+	#define ADDR_LOW_SHIFT		8
+	#define ADDR_MASK				GENMASK(27, 8)
+	#define ADDR_SHIFT			12
+	#define LOG_LINE_MAX_LEN		400
+#define PHYTIUM_REGFILE_HPDET	0x34
+#define PHYTIUM_REGFILE_IRER	0x38
+#define RX_EN 1
+#define RX_DIS 0
+#define PHYTIUM_REGFILE_ITER	0x3c
+#define TX_EN 1
+#define TX_DIS 0
+
+/*gpio share memory*/
+#define PHYTIUM_GPIO_OFFSET 0x40
 
 /* DMA register */
 #define PHYTIUM_DMA_CTL			0x0000
@@ -156,7 +174,7 @@ struct phyti2s_cmd {
 #define PHYTIUM_DMA_BDLPU(x)		(0x40 * x + 0x0040)
 #define PHYTIUM_DMA_BDLPL(x)		(0x40 * x + 0x0044)
 #define PHYTIUM_DMA_CHALX_DEV_ADDR(x)	(0x40 * x + 0x0048)
-	#define E2000_LSD_I2S_BASE		0x28009000
+	#define LSD_I2S_BASE		0x18009000
 	#define PLAYBACK_ADDRESS_OFFSET		0x1c8
 	#define CAPTRUE_ADDRESS_OFFSET		0x1c0
 #define PHYTIUM_DMA_CHALX_LVI(x)	(0x40 * x + 0x004c)

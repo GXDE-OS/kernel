@@ -2,7 +2,7 @@
 /*
  * Phytium CODEC ALSA SoC Audio driver
  *
- * Copyright (C) 2024, Phytium Technology Co., Ltd.
+ * Copyright (C) 2023-2024, Phytium Technology Co., Ltd.
  *
  */
 
@@ -32,7 +32,7 @@
 
 #include "phytium-codec-v2.h"
 
-#define PHYT_CODEC_V2_VERSION "1.0.0"
+#define PHYT_CODEC_V2_VERSION "1.1.1"
 #define PHYTIUM_RATES (SNDRV_PCM_RATE_192000 | \
 		SNDRV_PCM_RATE_96000 | \
 		SNDRV_PCM_RATE_88200 | \
@@ -136,24 +136,31 @@ int phyt_codec_msg_set_cmd(struct phytium_codec *priv)
 
 	if (timeout == 0) {
 		dev_err(priv->dev, "failed to receive msg, timeout\n");
-		ret = -EINVAL;
-	} else if (ans_msg->complete >= PHYTCODEC_COMPLETE_GENERIC_ERROR) {
-		dev_err(priv->dev, "receive msg; generic_error, error code:%d\n",
-					ans_msg->complete);
-		ret = -EINVAL;
+		return -EINVAL;
 	} else if (ans_msg->complete == PHYTCODEC_COMPLETE_SUCCESS) {
 		dev_dbg(priv->dev, "receive msg successfully\n");
+		if (ans_msg->status != 0) {
+			phyt_codec_show_status(ans_msg->status);
+			dev_err(priv->dev, "controller status error code:%d\n",
+					ans_msg->status);
+			return -EINVAL;
+		}
+	} else if (ans_msg->complete != PHYTCODEC_COMPLETE_SUCCESS) {
+		phyt_codec_show_status(ans_msg->status);
+		dev_err(priv->dev, "receive msg; error code:%d\n",
+					ans_msg->complete);
+		ret = -EINVAL;
+	} else {
+		dev_err(priv->dev, "unknown error");
+		ret = -EINVAL;
 	}
 
-	if (ans_msg->complete != PHYTCODEC_COMPLETE_SUCCESS)
-		phyt_codec_show_status(ans_msg->status);
 	return ret;
 }
 
-static int phyt_cmd(struct snd_soc_component *component,
+static int phyt_set_cmd(struct phytium_codec *priv,
 				unsigned int cmd)
 {
-	struct phytium_codec *priv = snd_soc_component_get_drvdata(component);
 	struct phytcodec_cmd *msg = priv->sharemem_base;
 	int ret = 0;
 
@@ -172,14 +179,13 @@ error:
 	return ret;
 }
 
-static int phyt_pm_cmd(struct snd_soc_component *component,
+static int phyt_pm_cmd(struct phytium_codec *priv,
 				unsigned int cmd)
 {
-	struct phytium_codec *priv = snd_soc_component_get_drvdata(component);
 	struct phytcodec_cmd *msg = priv->sharemem_base;
 	uint16_t total_regs_len;
 	uint8_t *regs;
-	int ret = 0;
+	int ret = 0, i = 0, cnt = 1;
 
 	memset(msg, 0, sizeof(struct phytcodec_cmd));
 
@@ -189,20 +195,33 @@ static int phyt_pm_cmd(struct snd_soc_component *component,
 	msg->cmd_subid = cmd;
 	msg->complete = 0;
 	msg->cmd_para.phytcodec_reg.cnt = 0;
-	if (cmd == PHYTCODEC_MSG_CMD_SET_RESUME)
+
+	if (cmd == PHYTCODEC_MSG_CMD_SET_RESUME) {
 		memcpy(msg->cmd_para.phytcodec_reg.regs, priv->regs, REG_SH_LEN);
+		phyt_writel_reg(priv->regfile_base, PHYTIUM_CODEC_INT_MASK, 0x0);
+		phyt_writel_reg(priv->regfile_base, PHYTIUM_CODEC_INT_ENABLE, 0x1);
+	}
 	ret = phyt_codec_msg_set_cmd(priv);
 	if (ret < 0) {
 		dev_err(priv->dev, "set cmd_subid 0x%x failed\n", cmd);
-		ret = -EINVAL;
-		goto error;
+		return -EINVAL;
 	}
 	total_regs_len = msg->cmd_para.phytcodec_reg.total_regs_len;
+	if (total_regs_len % REG_SH_LEN == 0)
+		cnt = total_regs_len / REG_SH_LEN;
+	else
+		cnt = total_regs_len / REG_SH_LEN + 1;
 
 	if (cmd == PHYTCODEC_MSG_CMD_SET_SUSPEND) {
 		regs = kmalloc(total_regs_len, GFP_KERNEL);
 		priv->regs = regs;
-		while (total_regs_len > REG_SH_LEN * msg->cmd_para.phytcodec_reg.cnt) {
+
+		for (i = 1; i < cnt; i++) {
+			if (msg->cmd_para.phytcodec_reg.cnt != i) {
+				dev_err(priv->dev, "error phytcodec_reg.cnt\n");
+				ret = -EINVAL;
+				goto error;
+			}
 			memcpy(regs, msg->cmd_para.phytcodec_reg.regs, REG_SH_LEN);
 			regs += REG_SH_LEN;
 			msg->complete = 0;
@@ -217,7 +236,12 @@ static int phyt_pm_cmd(struct snd_soc_component *component,
 			total_regs_len - REG_SH_LEN * (msg->cmd_para.phytcodec_reg.cnt - 1));
 	} else if (cmd == PHYTCODEC_MSG_CMD_SET_RESUME) {
 		regs = priv->regs;
-		while (total_regs_len > REG_SH_LEN * msg->cmd_para.phytcodec_reg.cnt) {
+		for (i = 1; i < cnt; i++) {
+			if (msg->cmd_para.phytcodec_reg.cnt != i) {
+				dev_err(priv->dev, "error phytcodec_reg.cnt\n");
+				ret = -EINVAL;
+				goto error;
+			}
 			regs += REG_SH_LEN;
 			memcpy(msg->cmd_para.phytcodec_reg.regs, regs, REG_SH_LEN);
 			msg->complete = 0;
@@ -229,56 +253,101 @@ static int phyt_pm_cmd(struct snd_soc_component *component,
 			}
 		}
 		kfree(priv->regs);
+		priv->regs = NULL;
 	}
+	return ret;
+
 error:
+	kfree(priv->regs);
+	priv->regs = NULL;
 	return ret;
 }
 
-static int phyt_show_registers(struct phytium_codec *priv)
+static int phyt_get_cmd(struct phytium_codec *priv, unsigned int cmd)
 {
 	struct phytcodec_cmd *msg = priv->sharemem_base;
-	int ret = 0, i;
+	int ret = 0, i = 0, cnt = 1;
+	uint16_t total_regs_len;
+	uint8_t *regs;
 
 	msg->reserved = 0;
 	msg->seq = 0;
 	msg->cmd_id = PHYTCODEC_MSG_CMD_GET;
-	msg->cmd_subid = 0;
+	msg->cmd_subid = cmd;
 	msg->complete = 0;
+	if (cmd == PHYTCODEC_MSG_CMD_GET_ALL_REGS)
+		msg->cmd_para.phytcodec_reg.cnt = 0;
 	ret = phyt_codec_msg_set_cmd(priv);
 	if (ret < 0) {
-		dev_err(priv->dev, "failed to get codec registers\n");
-		ret = -EINVAL;
-		goto error;
-	} else {
-		dev_dbg(priv->dev, "show codec registers\n");
-		for (i = 0; i < msg->len && i < 56; i++) {
-			dev_dbg(priv->dev, "%d ", msg->cmd_para.para[i]);
-			if (i % 16 == 0)
-				dev_dbg(priv->dev, "\n");
-		}
+		dev_err(priv->dev, "get cmd_subid 0x%x failed\n", cmd);
+		return -EINVAL;
 	}
-error:
+
+	total_regs_len = msg->cmd_para.phytcodec_reg.total_regs_len;
+	if (cmd == PHYTCODEC_MSG_CMD_GET_ALL_REGS) {
+		if (total_regs_len % REG_SH_LEN == 0)
+			cnt = total_regs_len / REG_SH_LEN;
+		else
+			cnt = total_regs_len / REG_SH_LEN + 1;
+		regs = kmalloc(total_regs_len, GFP_KERNEL);
+		priv->regs = regs;
+		for (i = 1; i < cnt; i++) {
+			if (msg->cmd_para.phytcodec_reg.cnt != i) {
+				dev_err(priv->dev, "error phytcodec_reg.cnt\n");
+				ret = -EINVAL;
+				goto error;
+			}
+			memcpy(regs, msg->cmd_para.phytcodec_reg.regs, REG_SH_LEN);
+			regs += REG_SH_LEN;
+			msg->complete = 0;
+			ret = phyt_codec_msg_set_cmd(priv);
+			if (ret < 0) {
+				dev_err(priv->dev, "set cmd_subid 0x%x failed\n", cmd);
+				ret = -EINVAL;
+				goto error;
+			}
+		}
+		memcpy(regs, msg->cmd_para.phytcodec_reg.regs,
+			total_regs_len - REG_SH_LEN * (msg->cmd_para.phytcodec_reg.cnt - 1));
+		for (i = 0; i < total_regs_len; i++)
+			dev_info(priv->dev, "0x%02x-0x%02x\n", i, priv->regs[i]);
+
+		kfree(priv->regs);
+		priv->regs = NULL;
+	}
 	return ret;
+error:
+	kfree(priv->regs);
+	priv->regs = NULL;
+	return -EINVAL;
 }
 
 static int phyt_probe(struct snd_soc_component *component)
 {
-	return phyt_cmd(component, PHYTCODEC_MSG_CMD_SET_PROBE);
+	struct phytium_codec *priv = snd_soc_component_get_drvdata(component);
+
+	return phyt_set_cmd(priv, PHYTCODEC_MSG_CMD_SET_PROBE);
 }
 
 static void phyt_remove(struct snd_soc_component *component)
 {
-	phyt_cmd(component, PHYTCODEC_MSG_CMD_SET_REMOVE);
+	struct phytium_codec *priv = snd_soc_component_get_drvdata(component);
+
+	phyt_set_cmd(priv, PHYTCODEC_MSG_CMD_SET_REMOVE);
 }
 
 static int phyt_suspend(struct snd_soc_component *component)
 {
-	return phyt_pm_cmd(component, PHYTCODEC_MSG_CMD_SET_SUSPEND);
+	struct phytium_codec *priv = snd_soc_component_get_drvdata(component);
+
+	return phyt_pm_cmd(priv, PHYTCODEC_MSG_CMD_SET_SUSPEND);
 }
 
 static int phyt_resume(struct snd_soc_component *component)
 {
-	return phyt_pm_cmd(component, PHYTCODEC_MSG_CMD_SET_RESUME);
+	struct phytium_codec *priv = snd_soc_component_get_drvdata(component);
+
+	return phyt_pm_cmd(priv, PHYTCODEC_MSG_CMD_SET_RESUME);
 }
 
 static int phyt_set_bias_level(struct snd_soc_component *component,
@@ -293,22 +362,22 @@ static int phyt_set_bias_level(struct snd_soc_component *component,
 
 	switch (level) {
 	case SND_SOC_BIAS_ON:
-		ret = phyt_cmd(component, PHYTCODEC_MSG_CMD_SET_BIAS_ON);
+		ret = phyt_set_cmd(priv, PHYTCODEC_MSG_CMD_SET_BIAS_ON);
 		break;
 
 	case SND_SOC_BIAS_PREPARE:
-		ret = phyt_cmd(component,  PHYTCODEC_MSG_CMD_SET_BIAS_PREPARE);
+		ret = phyt_set_cmd(priv,  PHYTCODEC_MSG_CMD_SET_BIAS_PREPARE);
 		break;
 
 	case SND_SOC_BIAS_STANDBY:
 		if (snd_soc_component_get_bias_level(component) == SND_SOC_BIAS_OFF)
-			ret = phyt_cmd(component, PHYTCODEC_MSG_CMD_SET_BIAS_STANDBY);
+			ret = phyt_set_cmd(priv, PHYTCODEC_MSG_CMD_SET_BIAS_STANDBY);
 		else
-			ret = phyt_cmd(component, PHYTCODEC_MSG_CMD_SET_BIAS_STANDBY);
+			ret = phyt_set_cmd(priv, PHYTCODEC_MSG_CMD_SET_BIAS_STANDBY);
 		break;
 
 	case SND_SOC_BIAS_OFF:
-		ret = phyt_cmd(component, PHYTCODEC_MSG_CMD_SET_BIAS_OFF);
+		ret = phyt_set_cmd(priv, PHYTCODEC_MSG_CMD_SET_BIAS_OFF);
 		break;
 	}
 
@@ -343,9 +412,9 @@ static int phyt_mute(struct snd_soc_dai *dai, int mute, int direction)
 	memset(msg, 0, sizeof(struct phytcodec_cmd));
 	msg->cmd_para.para[0] = (uint8_t)direction;
 	if (mute)
-		ret = phyt_cmd(component, PHYTCODEC_MSG_CMD_SET_MUTE);
+		ret = phyt_set_cmd(priv, PHYTCODEC_MSG_CMD_SET_MUTE);
 	else
-		ret = phyt_cmd(component, PHYTCODEC_MSG_CMD_SET_UNMUTE);
+		ret = phyt_set_cmd(priv, PHYTCODEC_MSG_CMD_SET_UNMUTE);
 
 	return ret;
 }
@@ -355,11 +424,12 @@ static int phyt_startup(struct snd_pcm_substream *substream,
 {
 	int ret;
 	struct snd_soc_component *component = dai->component;
+	struct phytium_codec *priv = snd_soc_component_get_drvdata(component);
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
-		ret = phyt_cmd(component, PHYTCODEC_MSG_CMD_SET_STARTUP);
+		ret = phyt_set_cmd(priv, PHYTCODEC_MSG_CMD_SET_STARTUP);
 	else
-		ret = phyt_cmd(component, PHYTCODEC_MSG_CMD_SET_STARTUP_RC);
+		ret = phyt_set_cmd(priv, PHYTCODEC_MSG_CMD_SET_STARTUP_RC);
 
 	return ret;
 }
@@ -369,11 +439,12 @@ static void phyt_shutdown(struct snd_pcm_substream *substream,
 {
 	int ret;
 	struct snd_soc_component *component = dai->component;
+	struct phytium_codec *priv = snd_soc_component_get_drvdata(component);
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
-		ret = phyt_cmd(component, PHYTCODEC_MSG_CMD_SET_SHUTDOWN);
+		ret = phyt_set_cmd(priv, PHYTCODEC_MSG_CMD_SET_SHUTDOWN);
 	else
-		ret = phyt_cmd(component, PHYTCODEC_MSG_CMD_SET_SHUTDOWN_RC);
+		ret = phyt_set_cmd(priv, PHYTCODEC_MSG_CMD_SET_SHUTDOWN_RC);
 }
 
 static int phyt_hw_params(struct snd_pcm_substream *substream,
@@ -386,19 +457,19 @@ static int phyt_hw_params(struct snd_pcm_substream *substream,
 
 	priv->channels = params_channels(params);
 	switch (params_width(params)) {
-	case 16:
+	case PHYTCODEC_FORMAT_S16:
 		wl = 3;
 		break;
-	case 18:
+	case PHYTCODEC_FORMAT_S18:
 		wl = 2;
 		break;
-	case 20:
+	case PHYTCODEC_FORMAT_S20:
 		wl = 1;
 		break;
-	case 24:
+	case PHYTCODEC_FORMAT_S24:
 		wl = 0;
 		break;
-	case 32:
+	case PHYTCODEC_FORMAT_S32:
 		wl = 4;
 		break;
 	default:
@@ -420,6 +491,7 @@ static int phyt_set_dai_fmt(struct snd_soc_dai *codec_dai,
 {
 	int ret;
 	struct snd_soc_component *component = codec_dai->component;
+	struct phytium_codec *priv = snd_soc_component_get_drvdata(component);
 
 	if ((fmt & SND_SOC_DAIFMT_MASTER_MASK) != SND_SOC_DAIFMT_CBS_CFS)
 		return -EINVAL;
@@ -430,7 +502,7 @@ static int phyt_set_dai_fmt(struct snd_soc_dai *codec_dai,
 	if ((fmt & SND_SOC_DAIFMT_INV_MASK) != SND_SOC_DAIFMT_NB_NF)
 		return -EINVAL;
 
-	ret = phyt_cmd(component, PHYTCODEC_MSG_CMD_SET_DAI_FMT);
+	ret = phyt_set_cmd(priv, PHYTCODEC_MSG_CMD_SET_DAI_FMT);
 
 	return ret;
 }
@@ -526,11 +598,41 @@ static void phyt_timer_handle(struct timer_list *t)
 	mod_timer(&priv->timer, jiffies + msecs_to_jiffies(2000));
 }
 
+static int phyt_get_one_reg(struct phytium_codec *priv, uint8_t arg1, uint8_t arg2)
+{
+	struct phytcodec_cmd *msg = priv->sharemem_base;
+	int ret = 0;
+
+	memset(msg, 0, sizeof(struct phytcodec_cmd));
+	msg->cmd_para.rw_data.addr = arg1;
+	msg->cmd_para.rw_data.reg = arg2;
+	ret = phyt_get_cmd(priv, PHYTCODEC_MSG_CMD_GET_ONE_REG);
+	dev_info(priv->dev, "val: 0x%x\n", msg->cmd_para.rw_data.val);
+
+	return ret;
+}
+
+static int phyt_set_one_reg(struct phytium_codec *priv, uint8_t arg1, uint8_t arg2, uint16_t arg3)
+{
+	struct phytcodec_cmd *msg = priv->sharemem_base;
+	int ret = 0;
+
+	memset(msg, 0, sizeof(struct phytcodec_cmd));
+	msg->cmd_para.rw_data.addr = arg1;
+	msg->cmd_para.rw_data.reg = arg2;
+	msg->cmd_para.rw_data.val = arg3;
+	ret = phyt_set_cmd(priv, PHYTCODEC_MSG_CMD_SET_ONE_REG);
+
+	return ret;
+}
+
 static ssize_t debug_show(struct device *dev, struct device_attribute *da, char *buf)
 {
 	struct phytium_codec *priv = dev_get_drvdata(dev);
 	ssize_t ret;
 	u32 reg;
+	dev_info(dev, "Usage: echo <command> [args...] > debug\n");
+	dev_info(dev, "Usage: echo help 1 > debug for more details");
 
 	reg = phyt_readl_reg(priv->regfile_base, PHYTIUM_CODEC_DEBUG);
 	ret = sprintf(buf, "%x\n", reg);
@@ -539,60 +641,126 @@ static ssize_t debug_show(struct device *dev, struct device_attribute *da, char 
 }
 
 static ssize_t debug_store(struct device *dev, struct device_attribute *da,
-		const char *buf, size_t size)
+					const char *buf, size_t size)
 {
 	struct phytium_codec *priv = dev_get_drvdata(dev);
-	u8 loc, dis_en, status = 0;
-	char *p;
-	char *token;
+	char *arg1_str = NULL, *arg2_str = NULL, *arg3_str = NULL;
+	uint8_t arg1 = 0, arg2 = 0;
+	uint16_t arg3 = 0;
+	char *cmd_buffer, *cmd;
 	long value;
 	u32 reg;
+	int status;
 
-	dev_info(dev, "first number is debug/alive/register, the second number is disable/enable");
-	dev_info(dev, "echo 2 1 > debug, print all codec register");
+	cmd_buffer = kmalloc(size + 1, GFP_KERNEL);
+	if (!cmd_buffer)
+		goto error;
+	strscpy(cmd_buffer, buf, size + 1);
 
-	p = kmalloc(size, GFP_KERNEL);
-	strscpy(p, buf, sizeof(p));
-	token = strsep(&p, " ");
-	if (!token)
-		return -EINVAL;
-	status = kstrtol(token, 0, &value);
-	if (status)
-		return status;
-	loc = (u8)value;
+	cmd = strsep(&cmd_buffer, " ");
+	if (!cmd) {
+		dev_err(dev, "Invalid command argument\n");
+		goto error;
+	}
 
-	token = strsep(&p, " ");
-	if (!token)
-		return -EINVAL;
-	status = kstrtol(token, 0, &value);
-	if (status)
-		return status;
-	dis_en = value;
-
-	reg = phyt_readl_reg(priv->regfile_base, PHYTIUM_CODEC_DEBUG);
-	if (loc == 1) {
-		if (dis_en == 1) {
-			priv->alive_enabled = true;
-			reg |= BIT(loc);
-		} else if (dis_en == 0) {
-			priv->alive_enabled = false;
-			reg &= ~BIT(loc);
+	arg1_str = strsep(&cmd_buffer, " ");
+	if (arg1_str) {
+		status = kstrtoul(arg1_str, 0, &value);
+		if (status) {
+			dev_err(dev, "Invalid value for arg1: %s\n", arg1_str);
+			goto error;
 		}
-	} else if (loc == 0) {
-		if (dis_en == 1) {
-			priv->debug_enabled = true;
-			reg |= BIT(loc);
-		} else if (dis_en == 0) {
-			priv->debug_enabled = false;
-			reg &= ~BIT(loc);
-		}
-	} else if (loc == 2)
-		if (dis_en == 1)
-			phyt_show_registers(priv);
-	phyt_writel_reg(priv->regfile_base, PHYTIUM_CODEC_DEBUG, reg);
-	kfree(p);
+		arg1 = (uint8_t)value;
+	}
 
+	arg2_str = strsep(&cmd_buffer, " ");
+	if (arg2_str) {
+		status = kstrtoul(arg2_str, 0, &value);
+		if (status) {
+			dev_err(dev, "Invalid value for arg2: %s\n", arg2_str);
+			goto error;
+		}
+		arg2 = (uint8_t)value;
+	}
+
+	arg3_str = strsep(&cmd_buffer, " ");
+	if (arg3_str) {
+		status = kstrtou16(arg3_str, 0, &arg3);
+		if (status) {
+			dev_err(dev, "Invalid value for arg3: %s\n", arg3_str);
+			goto error;
+		}
+	}
+
+	if (strcmp(cmd, "dbg") == 0) {
+		if (!arg1_str || !arg2_str) {
+			dev_err(dev, "debug command requires two arguments\n");
+			goto error;
+		}
+		reg = phyt_readl_reg(priv->regfile_base, PHYTIUM_CODEC_DEBUG);
+		if (arg1 == 1) {
+			if (arg2 == 1) {
+				priv->alive_enabled = true;
+				reg |= BIT(arg1);
+			} else if (arg2 == 0) {
+				priv->alive_enabled = false;
+				reg &= ~BIT(arg1);
+			} else {
+				dev_err(dev, "arg2 should be 0 or 1 for dbg command\n");
+				goto error;
+			}
+		} else if (arg1 == 0) {
+			if (arg2 == 1) {
+				priv->debug_enabled = true;
+				reg |= BIT(arg1);
+			} else if (arg2 == 0) {
+				priv->debug_enabled = false;
+				reg &= ~BIT(arg1);
+			} else {
+				dev_err(dev, "arg2 should be 0 or 1 for dbg command\n");
+				goto error;
+			}
+		} else {
+			dev_err(dev, "arg1 should be 0 or 1 for dbg command\n");
+			goto error;
+		}
+		phyt_writel_reg(priv->regfile_base, PHYTIUM_CODEC_DEBUG, reg);
+	} else if (strcmp(cmd, "get") == 0) {
+		if (!arg1_str || !arg2_str) {
+			dev_err(dev, "get command requires two arguments\n");
+			goto error;
+		}
+		phyt_get_one_reg(priv, arg1, arg2);
+	} else if (strcmp(cmd, "set") == 0) {
+		if (!arg1_str || !arg2_str || !arg3_str) {
+			dev_err(dev, "set command requires three arguments\n");
+			goto error;
+		}
+		phyt_set_one_reg(priv, arg1, arg2, arg3);
+	} else if (strcmp(cmd, "dump") == 0) {
+		if (!arg1_str) {
+			dev_err(dev, "dump command requires one argument\n");
+			goto error;
+		}
+		phyt_get_cmd(priv, PHYTCODEC_MSG_CMD_GET_ALL_REGS);
+	} else if (strcmp(cmd, "help") == 0) {
+		dev_info(dev, "Available commands:\n"
+			"dump all regs: echo \"dump\" > debug\n"
+			"dbg: echo \"dbg 0 1\" > debug\n"
+			"heartbeat: echo \"dbg 1 1\" > debug\n"
+			"read a reg: echo \"get [addr] [reg]\" > debug\n"
+			"write a reg: echo \"set [addr] [reg] [val]\" > debug\n");
+	} else {
+		dev_err(dev, "Unknown command: %s\n", cmd);
+		goto error;
+	}
+
+	kfree(cmd_buffer);
 	return size;
+
+error:
+	kfree(cmd_buffer);
+	return -EINVAL;
 }
 
 static DEVICE_ATTR_RW(debug);
@@ -613,19 +781,31 @@ static int phyt_get_channels(struct phytium_codec *priv)
 	uint8_t channels;
 
 	memset(msg, 0, sizeof(struct phytcodec_cmd));
-	msg->reserved = 0;
-	msg->seq = 0;
-	msg->cmd_id = PHYTCODEC_MSG_CMD_GET;
-	msg->cmd_subid = PHYTCODEC_MSG_CMD_GET_CHANNELS;
-	msg->complete = 0;
-
-	ret = phyt_codec_msg_set_cmd(priv);
-	if (ret < 0) {
-		dev_err(priv->dev, "failed to get codec channels\n");
-		return -EINVAL;
-	}
+	ret = phyt_get_cmd(priv, PHYTCODEC_MSG_CMD_GET_CHANNELS);
 	channels = msg->cmd_para.para[0] * 2;
+
 	return channels;
+}
+
+static void phyt_codec_init(struct phytium_codec *priv)
+{
+	phyt_disable_debug(priv);
+	phyt_disable_alive(priv);
+	priv->debug_enabled = false;
+	priv->alive_enabled = false;
+	priv->heartbeat = phyt_heartbeat;
+	priv->timer.expires = jiffies + msecs_to_jiffies(10000);
+	timer_setup(&priv->timer, phyt_timer_handle, 0);
+	add_timer(&priv->timer);
+
+	if (sysfs_create_group(&priv->dev->kobj, &phyt_codec_device_group))
+		dev_warn(priv->dev, "failed to create sysfs\n");
+
+	phyt_dai.playback.channels_max = phyt_get_channels(priv);
+	phyt_dai.capture.channels_max = phyt_dai.playback.channels_max;
+
+	phyt_writel_reg(priv->regfile_base, PHYTIUM_CODEC_INT_MASK, 0x0);
+	phyt_writel_reg(priv->regfile_base, PHYTIUM_CODEC_INT_ENABLE, 0x1);
 }
 
 static int phyt_codec_probe(struct platform_device *pdev)
@@ -670,20 +850,7 @@ static int phyt_codec_probe(struct platform_device *pdev)
 		goto failed_regmap_init;
 	}
 
-	phyt_disable_debug(priv);
-	phyt_disable_alive(priv);
-	priv->debug_enabled = false;
-	priv->alive_enabled = false;
-	priv->heartbeat = phyt_heartbeat;
-	priv->timer.expires = jiffies + msecs_to_jiffies(10000);
-	timer_setup(&priv->timer, phyt_timer_handle, 0);
-	add_timer(&priv->timer);
-
-	if (sysfs_create_group(&pdev->dev.kobj, &phyt_codec_device_group))
-		dev_warn(dev, "failed to create sysfs\n");
-
-	phyt_dai.playback.channels_max = phyt_get_channels(priv);
-	phyt_dai.capture.channels_max = phyt_dai.playback.channels_max;
+	phyt_codec_init(priv);
 
 	ret = devm_snd_soc_register_component(dev, &phyt_component_driver,
 					      &phyt_dai, 1);
