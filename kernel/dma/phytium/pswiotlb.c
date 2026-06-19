@@ -870,7 +870,13 @@ void pswiotlb_store_local_node(struct pci_dev *dev, struct pci_bus *bus)
 	struct p_io_tlb_pool *defpool;
 	struct p_io_tlb_mem *mem;
 
+	if (!pswiotlb_node_num)
+		return;
+
 	dev->dev.local_node = pcibus_to_node(bus);
+	if (dev->dev.local_node == NUMA_NO_NODE)
+		return;
+
 	/* register pswiotlb resources */
 	dev->dev.dma_p_io_tlb_mem = p_io_tlb_default_mem;
 	nid = dev->dev.local_node;
@@ -879,6 +885,8 @@ void pswiotlb_store_local_node(struct pci_dev *dev, struct pci_bus *bus)
 	pci_info(dev, "numa node: %d, pswiotlb defpool range: [%#018Lx-%#018Lx]\n"
 				"local node range: [%#018Lx-%#018Lx]\n", nid,
 		defpool->start, defpool->end, mem->node_min_addr, mem->node_max_addr);
+
+	dma_set_seg_boundary(&dev->dev, 0xffffffffffff);
 }
 /*
  * Return the offset into a pswiotlb slot required to keep the device happy.
@@ -1120,10 +1128,10 @@ static int pswiotlb_pool_find_slots(struct device *dev, int nid, struct p_io_tlb
 		index = pswiotlb_area_find_slots(dev, nid, pool, i, orig_addr,
 						alloc_size, alloc_align_mask);
 		if (index >= 0) {
-			if ((pool != &p_io_tlb_default_mem[nid].defpool) &&
-						!pool->transient) {
-				bitmap_set(pool->busy_record, i, 1);
-			}
+			if ((pool != &p_io_tlb_default_mem[nid].defpool)
+						&& !pool->transient
+						&& !test_bit(i, pool->busy_record))
+				set_bit(i, pool->busy_record);
 			return index;
 		}
 		if (++i >= pool->nareas)
@@ -1425,8 +1433,9 @@ static void pswiotlb_release_slots(struct device *dev, int nid, phys_addr_t tlb_
 	     i--)
 		mem->slots[i].list = ++count;
 	area->used -= nslots;
-	if ((mem != &p_io_tlb_default_mem[nid].defpool) && (area->used == 0))
-		bitmap_clear(mem->busy_record, aindex, 1);
+	if ((mem != &p_io_tlb_default_mem[nid].defpool) && (area->used == 0)
+				&& test_bit(aindex, mem->busy_record))
+		clear_bit(aindex, mem->busy_record);
 	clear_bit(PG_pswiotlb, &page->flags);
 	spin_unlock_irqrestore(&area->lock, flags);
 }
@@ -1719,6 +1728,9 @@ static void pswiotlb_create_pswiotlb_debugfs_files(const char *dirname)
 static int __init pswiotlb_create_default_debugfs(void)
 {
 	char name[20] = "";
+
+	if (!pswiotlb_node_num)
+		return 0;
 
 	if (!pswiotlb_mtimer_alive && !pswiotlb_force_disable
 				&& is_phytium_ps_socs()) {

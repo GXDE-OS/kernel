@@ -426,6 +426,35 @@ static const struct rtw89_reg_def rtw8852a_dcfo_comp = {
 	R_DCFO_COMP_S0, B_DCFO_COMP_S0_MSK
 };
 
+static const struct rtw89_reg_def rtw8852a_nhm_th[RTW89_NHM_TH_NUM] = {
+	{R_NHM_CFG, B_NHM_TH0_MSK},
+	{R_NHM_TH1, B_NHM_TH1_MSK},
+	{R_NHM_TH1, B_NHM_TH2_MSK},
+	{R_NHM_TH1, B_NHM_TH3_MSK},
+	{R_NHM_TH1, B_NHM_TH4_MSK},
+	{R_NHM_TH5, B_NHM_TH5_MSK},
+	{R_NHM_TH5, B_NHM_TH6_MSK},
+	{R_NHM_TH5, B_NHM_TH7_MSK},
+	{R_NHM_TH5, B_NHM_TH8_MSK},
+	{R_NHM_TH9, B_NHM_TH9_MSK},
+	{R_NHM_TH9, B_NHM_TH10_MSK},
+};
+
+static const struct rtw89_reg_def rtw8852a_nhm_rpt[RTW89_NHM_RPT_NUM] = {
+	{R_NHM_CNT0, B_NHM_CNT0_MSK},
+	{R_NHM_CNT0, B_NHM_CNT1_MSK},
+	{R_NHM_CNT2, B_NHM_CNT2_MSK},
+	{R_NHM_CNT2, B_NHM_CNT3_MSK},
+	{R_NHM_CNT4, B_NHM_CNT4_MSK},
+	{R_NHM_CNT4, B_NHM_CNT5_MSK},
+	{R_NHM_CNT6, B_NHM_CNT6_MSK},
+	{R_NHM_CNT6, B_NHM_CNT7_MSK},
+	{R_NHM_CNT8, B_NHM_CNT8_MSK},
+	{R_NHM_CNT8, B_NHM_CNT9_MSK},
+	{R_NHM_CNT10, B_NHM_CNT10_MSK},
+	{R_NHM_CNT10, B_NHM_CNT11_MSK},
+};
+
 static const struct rtw89_imr_info rtw8852a_imr_info = {
 	.wdrls_imr_set		= B_AX_WDRLS_IMR_SET,
 	.wsec_imr_reg		= R_AX_SEC_DEBUG,
@@ -481,6 +510,15 @@ static const struct rtw89_xtal_info rtw8852a_xtal_info = {
 static const struct rtw89_rrsr_cfgs rtw8852a_rrsr_cfgs = {
 	.ref_rate = {R_AX_TRXPTCL_RRSR_CTL_0, B_AX_WMAC_RESP_REF_RATE_SEL, 0},
 	.rsc = {R_AX_TRXPTCL_RRSR_CTL_0, B_AX_WMAC_RESP_RSC_MASK, 2},
+};
+
+static const struct rtw89_rfkill_regs rtw8852a_rfkill_regs = {
+	.pinmux = {R_AX_GPIO8_15_FUNC_SEL,
+		   B_AX_PINMUX_GPIO9_FUNC_SEL_MASK,
+		   0xf},
+	.mode = {R_AX_GPIO_EXT_CTRL + 2,
+		 (B_AX_GPIO_MOD_9 | B_AX_GPIO_IO_SEL_9) >> 16,
+		 0x0},
 };
 
 static const struct rtw89_dig_regs rtw8852a_dig_regs = {
@@ -586,8 +624,6 @@ static int rtw8852a_read_efuse(struct rtw89_dev *rtwdev, u8 *log_map,
 	default:
 		return -ENOTSUPP;
 	}
-
-	rtw89_info(rtwdev, "chip rfe_type is %d\n", efuse->rfe_type);
 
 	return 0;
 }
@@ -2071,10 +2107,17 @@ static void rtw8852a_query_ppdu(struct rtw89_dev *rtwdev,
 {
 	u8 path;
 	u8 *rx_power = phy_ppdu->rssi;
+	u8 raw;
 
-	if (!status->signal)
-		status->signal = RTW89_RSSI_RAW_TO_DBM(max(rx_power[RF_PATH_A],
-							   rx_power[RF_PATH_B]));
+	if (!status->signal) {
+		if (phy_ppdu->to_self)
+			raw = ewma_rssi_read(&rtwdev->phystat.bcn_rssi);
+		else
+			raw = max(rx_power[RF_PATH_A], rx_power[RF_PATH_B]);
+
+		status->signal = RTW89_RSSI_RAW_TO_DBM(raw);
+	}
+
 	for (path = 0; path < rtwdev->chip->rf_path_num; path++) {
 		status->chains |= BIT(path);
 		status->chain_signal[path] = RTW89_RSSI_RAW_TO_DBM(rx_power[path]);
@@ -2128,11 +2171,13 @@ static const struct rtw89_chip_ops rtw8852a_chip_ops = {
 	.cfg_txrx_path		= NULL,
 	.set_txpwr_ul_tb_offset	= rtw8852a_set_txpwr_ul_tb_offset,
 	.digital_pwr_comp	= NULL,
+	.calc_rx_gain_normal	= NULL,
 	.pwr_on_func		= NULL,
 	.pwr_off_func		= NULL,
 	.query_rxdesc		= rtw89_core_query_rxdesc,
 	.fill_txdesc		= rtw89_core_fill_txdesc,
 	.fill_txdesc_fwcmd	= rtw89_core_fill_txdesc,
+	.get_ch_dma		= rtw89_core_get_ch_dma,
 	.cfg_ctrl_path		= rtw89_mac_cfg_ctrl_path,
 	.mac_cfg_gnt		= rtw89_mac_cfg_gnt,
 	.stop_sch_tx		= rtw89_mac_stop_sch_tx,
@@ -2142,9 +2187,11 @@ static const struct rtw89_chip_ops rtw8852a_chip_ops = {
 	.h2c_assoc_cmac_tbl	= rtw89_fw_h2c_assoc_cmac_tbl,
 	.h2c_ampdu_cmac_tbl	= NULL,
 	.h2c_txtime_cmac_tbl	= rtw89_fw_h2c_txtime_cmac_tbl,
+	.h2c_punctured_cmac_tbl	= NULL,
 	.h2c_default_dmac_tbl	= NULL,
 	.h2c_update_beacon	= rtw89_fw_h2c_update_beacon,
 	.h2c_ba_cam		= rtw89_fw_h2c_ba_cam,
+	.h2c_wow_cam_update	= rtw89_fw_h2c_wow_cam_update,
 
 	.btc_set_rfe		= rtw8852a_btc_set_rfe,
 	.btc_init_cfg		= rtw8852a_btc_init_cfg,
@@ -2173,10 +2220,14 @@ const struct rtw89_chip_info rtw8852a_chip_info = {
 	.small_fifo_size	= false,
 	.dle_scc_rsvd_size	= 0,
 	.max_amsdu_limit	= 3500,
+	.max_vht_mpdu_cap	= IEEE80211_VHT_CAP_MAX_MPDU_LENGTH_11454,
+	.max_eht_mpdu_cap	= 0,
+	.max_tx_agg_num		= 128,
+	.max_rx_agg_num		= 64,
 	.dis_2g_40m_ul_ofdma	= true,
 	.rsvd_ple_ofst		= 0x6f800,
-	.hfc_param_ini		= rtw8852a_hfc_param_ini_pcie,
-	.dle_mem		= rtw8852a_dle_mem_pcie,
+	.hfc_param_ini		= {rtw8852a_hfc_param_ini_pcie, NULL, NULL},
+	.dle_mem		= {rtw8852a_dle_mem_pcie, NULL, NULL, NULL},
 	.wde_qempty_acq_grpnum	= 16,
 	.wde_qempty_mgq_grpsel	= 16,
 	.rf_base_addr		= {0xc000, 0xd000},
@@ -2210,6 +2261,7 @@ const struct rtw89_chip_info rtw8852a_chip_info = {
 	.support_ant_gain	= false,
 	.support_tas		= false,
 	.support_sar_by_ant	= false,
+	.support_noise		= true,
 	.ul_tb_waveform_ctrl	= false,
 	.ul_tb_pwr_diff		= false,
 	.rx_freq_frome_ie	= true,
@@ -2226,6 +2278,7 @@ const struct rtw89_chip_info rtw8852a_chip_info = {
 	.bacam_num		= 2,
 	.bacam_dynamic_num	= 4,
 	.bacam_ver		= RTW89_BACAM_V0,
+	.addrcam_ver		= 0,
 	.ppdu_max_usr		= 4,
 	.sec_ctrl_efuse_size	= 4,
 	.physical_efuse_size	= 1216,
@@ -2272,20 +2325,24 @@ const struct rtw89_chip_info rtw8852a_chip_info = {
 	.cfo_hw_comp            = false,
 	.dcfo_comp		= &rtw8852a_dcfo_comp,
 	.dcfo_comp_sft		= 10,
+	.nhm_report		= &rtw8852a_nhm_rpt,
+	.nhm_th			= &rtw8852a_nhm_th,
 	.imr_info		= &rtw8852a_imr_info,
 	.imr_dmac_table		= NULL,
 	.imr_cmac_table		= NULL,
 	.rrsr_cfgs		= &rtw8852a_rrsr_cfgs,
 	.bss_clr_vld		= {R_BSS_CLR_MAP, B_BSS_CLR_MAP_VLD0},
 	.bss_clr_map_reg	= R_BSS_CLR_MAP,
-	.rfkill_init		= {},
-	.rfkill_get		= {},
+	.rfkill_init		= &rtw8852a_rfkill_regs,
+	.rfkill_get		= {R_AX_GPIO_EXT_CTRL, B_AX_GPIO_IN_9},
+	.btc_sb			= {{{R_AX_SCOREBOARD, R_AX_SCOREBOARD},}},
 	.dma_ch_mask		= 0,
 	.edcca_regs		= &rtw8852a_edcca_regs,
 #ifdef CONFIG_PM
 	.wowlan_stub		= &rtw_wowlan_stub_8852a,
 #endif
 	.xtal_info		= &rtw8852a_xtal_info,
+	.default_quirks		= 0,
 };
 EXPORT_SYMBOL(rtw8852a_chip_info);
 

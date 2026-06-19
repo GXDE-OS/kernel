@@ -59,14 +59,28 @@ enum iommu_dma_cookie_type {
 	IOMMU_DMA_MSI_COOKIE,
 };
 
+enum iommu_dma_queue_type {
+	IOMMU_DMA_OPTS_PER_CPU_QUEUE,
+	IOMMU_DMA_OPTS_SINGLE_QUEUE,
+};
+
+struct iommu_dma_options {
+	enum iommu_dma_queue_type qt;
+	size_t		fq_size;
+	unsigned int	fq_timeout;
+};
+
 struct iommu_dma_cookie {
 	enum iommu_dma_cookie_type	type;
 	union {
 		/* Full allocator for IOMMU_DMA_IOVA_COOKIE */
 		struct {
 			struct iova_domain	iovad;
-
-			struct iova_fq __percpu *fq;	/* Flush queue */
+			/* Flush queue */
+			union {
+				struct iova_fq	*single_fq;
+				struct iova_fq	__percpu *percpu_fq;
+			};
 			/* Number of TLB flushes that have been started */
 			atomic64_t		fq_flush_start_cnt;
 			/* Number of TLB flushes that have been finished */
@@ -83,16 +97,14 @@ struct iommu_dma_cookie {
 
 	/* Domain for flush queue callback; NULL if flush queue not in use */
 	struct iommu_domain		*fq_domain;
+	/* Options for dma-iommu use */
+	struct iommu_dma_options	options;
 	struct mutex			mutex;
+
+	struct work_struct free_iova_work;
 };
 
 static DEFINE_STATIC_KEY_FALSE(iommu_deferred_attach_enabled);
-
-/* Number of entries per flush queue */
-#define IOVA_FQ_SIZE	256
-
-/* Timeout (in ms) after which entries are flushed from the queue */
-#define IOVA_FQ_TIMEOUT	10
 
 /* Flush queue entry for deferred flushing */
 struct iova_fq_entry {
@@ -104,14 +116,14 @@ struct iova_fq_entry {
 
 /* Per-CPU flush queue structure */
 struct iova_fq {
-	struct iova_fq_entry entries[IOVA_FQ_SIZE];
-	unsigned int head, tail;
 	spinlock_t lock;
+	unsigned int head, tail;
+	unsigned int mod_mask;
+	struct iova_fq_entry entries[];
 };
 
 #define fq_ring_for_each(i, fq) \
-	for ((i) = (fq)->head; (i) != (fq)->tail; (i) = ((i) + 1) % IOVA_FQ_SIZE)
-
+	for ((i) = (fq)->head; (i) != (fq)->tail; (i) = ((i) + 1) & (fq)->mod_mask)
 /*
  * The following functions are ported from
  * ./drivers/iommu/dma-iommu.c
@@ -119,7 +131,7 @@ struct iova_fq {
  * static inline bool fq_full(struct iova_fq *fq);
  * static void fq_flush_iotlb(struct iommu_dma_cookie *cookie);
  * static inline unsigned int fq_ring_add(struct iova_fq *fq);
- * static void fq_ring_free(struct iommu_dma_cookie *cookie, struct iova_fq *fq);
+ * static void fq_ring_free_locked(struct iommu_dma_cookie *cookie, struct iova_fq *fq);
  * static size_t iommu_pgsize(struct iommu_domain *domain, unsigned long iova,
  *		phys_addr_t paddr, size_t size, size_t *count);
  * static int __iommu_map_pages(struct iommu_domain *domain, unsigned long iova,
@@ -150,7 +162,7 @@ struct iova_fq {
 static inline bool fq_full(struct iova_fq *fq)
 {
 	assert_spin_locked(&fq->lock);
-	return (((fq->tail + 1) % IOVA_FQ_SIZE) == fq->head);
+	return (((fq->tail + 1) & fq->mod_mask) == fq->head);
 }
 
 static inline unsigned int fq_ring_add(struct iova_fq *fq)
@@ -159,12 +171,12 @@ static inline unsigned int fq_ring_add(struct iova_fq *fq)
 
 	assert_spin_locked(&fq->lock);
 
-	fq->tail = (idx + 1) % IOVA_FQ_SIZE;
+	fq->tail = (idx + 1) & fq->mod_mask;
 
 	return idx;
 }
 
-static void fq_ring_free(struct iommu_dma_cookie *cookie, struct iova_fq *fq)
+static void fq_ring_free_locked(struct iommu_dma_cookie *cookie, struct iova_fq *fq)
 {
 	u64 counter = atomic64_read(&cookie->fq_flush_finish_cnt);
 	unsigned int idx;
@@ -181,7 +193,7 @@ static void fq_ring_free(struct iommu_dma_cookie *cookie, struct iova_fq *fq)
 			       fq->entries[idx].iova_pfn,
 			       fq->entries[idx].pages);
 
-		fq->head = (fq->head + 1) % IOVA_FQ_SIZE;
+		fq->head = (fq->head + 1) & fq->mod_mask;
 	}
 }
 
@@ -268,6 +280,58 @@ static int __iommu_map_pages(struct iommu_domain *domain, unsigned long iova,
 	}
 
 	return ret;
+}
+
+static void queue_iova(struct iommu_dma_cookie *cookie,
+		unsigned long pfn, unsigned long pages,
+		struct list_head *freelist)
+{
+	struct iova_fq *fq;
+	unsigned long flags;
+	unsigned int idx;
+
+	/*
+	 * Order against the IOMMU driver's pagetable update from unmapping
+	 * @pte, to guarantee that fq_flush_iotlb() observes that if called
+	 * from a different CPU before we release the lock below. Full barrier
+	 * so it also pairs with iommu_dma_init_fq() to avoid seeing partially
+	 * written fq state here.
+	 */
+	smp_mb();
+
+	if (cookie->options.qt == IOMMU_DMA_OPTS_SINGLE_QUEUE)
+		fq = cookie->single_fq;
+	else
+		fq = raw_cpu_ptr(cookie->percpu_fq);
+
+	spin_lock_irqsave(&fq->lock, flags);
+
+	/*
+	 * First remove all entries from the flush queue that have already been
+	 * flushed out on another CPU. This makes the fq_full() check below less
+	 * likely to be true.
+	 */
+	fq_ring_free_locked(cookie, fq);
+
+	if (fq_full(fq)) {
+		fq_flush_iotlb(cookie);
+		fq_ring_free_locked(cookie, fq);
+	}
+
+	idx = fq_ring_add(fq);
+
+	fq->entries[idx].iova_pfn = pfn;
+	fq->entries[idx].pages    = pages;
+	fq->entries[idx].counter  = atomic64_read(&cookie->fq_flush_start_cnt);
+	list_splice(freelist, &fq->entries[idx].freelist);
+
+	spin_unlock_irqrestore(&fq->lock, flags);
+
+	/* Avoid false sharing as much as possible. */
+	if (!atomic_read(&cookie->fq_timer_on) &&
+	    !atomic_xchg(&cookie->fq_timer_on, 1))
+		mod_timer(&cookie->fq_timer,
+			  jiffies + msecs_to_jiffies(cookie->options.fq_timeout));
 }
 
 static int __iommu_map(struct iommu_domain *domain, unsigned long iova,
@@ -442,54 +506,6 @@ static int dma_info_to_prot(enum dma_data_direction dir, bool coherent,
 	default:
 		return 0;
 	}
-}
-
-static void queue_iova(struct iommu_dma_cookie *cookie,
-		unsigned long pfn, unsigned long pages,
-		struct list_head *freelist)
-{
-	struct iova_fq *fq;
-	unsigned long flags;
-	unsigned int idx;
-
-	/*
-	 * Order against the IOMMU driver's pagetable update from unmapping
-	 * @pte, to guarantee that fq_flush_iotlb() observes that if called
-	 * from a different CPU before we release the lock below. Full barrier
-	 * so it also pairs with iommu_dma_init_fq() to avoid seeing partially
-	 * written fq state here.
-	 */
-	smp_mb();
-
-	fq = raw_cpu_ptr(cookie->fq);
-	spin_lock_irqsave(&fq->lock, flags);
-
-	/*
-	 * First remove all entries from the flush queue that have already been
-	 * flushed out on another CPU. This makes the fq_full() check below less
-	 * likely to be true.
-	 */
-	fq_ring_free(cookie, fq);
-
-	if (fq_full(fq)) {
-		fq_flush_iotlb(cookie);
-		fq_ring_free(cookie, fq);
-	}
-
-	idx = fq_ring_add(fq);
-
-	fq->entries[idx].iova_pfn = pfn;
-	fq->entries[idx].pages    = pages;
-	fq->entries[idx].counter  = atomic64_read(&cookie->fq_flush_start_cnt);
-	list_splice(freelist, &fq->entries[idx].freelist);
-
-	spin_unlock_irqrestore(&fq->lock, flags);
-
-	/* Avoid false sharing as much as possible. */
-	if (!atomic_read(&cookie->fq_timer_on) &&
-	    !atomic_xchg(&cookie->fq_timer_on, 1))
-		mod_timer(&cookie->fq_timer,
-			  jiffies + msecs_to_jiffies(IOVA_FQ_TIMEOUT));
 }
 
 static dma_addr_t iommu_dma_alloc_iova(struct iommu_domain *domain,
@@ -1005,8 +1021,6 @@ static int iommu_dma_map_sg_pswiotlb_pagesize(struct device *dev, struct scatter
 	struct scatterlist *s;
 	int i;
 
-	sg_dma_mark_swiotlb(sg);
-
 	for_each_sg(sg, s, nents, i) {
 		sg_dma_address(s) = pswiotlb_iommu_dma_map_page(dev, sg_page(s),
 				s->offset, s->length, dir, attrs);
@@ -1160,7 +1174,7 @@ void pswiotlb_iommu_dma_unmap_sg(struct device *dev, struct scatterlist *sg,
 	dma_addr_t start, end = 0, start_orig;
 	struct scatterlist *tmp, *s;
 	struct scatterlist *sg_orig = sg;
-	int i;
+	int i, j;
 	struct iommu_domain *domain = iommu_get_dma_domain(dev);
 	struct iommu_dma_cookie *cookie = domain->iova_cookie;
 	struct iova_domain *iovad = &cookie->iovad;
@@ -1195,10 +1209,10 @@ void pswiotlb_iommu_dma_unmap_sg(struct device *dev, struct scatterlist *sg,
 		/* check whether dma addr is in local node */
 		start_orig = start;
 		if (dir != DMA_TO_DEVICE) {
-			for_each_sg(sg_orig, s, nents, i) {
+			for_each_sg(sg_orig, s, nents, j) {
 				unsigned int s_iova_off = iova_offset(iovad, s->offset);
 
-				if (i > 0)
+				if (j > 0)
 					start_orig += s_iova_off;
 				iommu_dma_unmap_page_sg(dev, start_orig,
 						s_iova_off, s->length,

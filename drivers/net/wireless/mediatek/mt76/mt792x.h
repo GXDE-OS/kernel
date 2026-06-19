@@ -66,7 +66,7 @@ struct mt792x_fw_features {
 
 enum {
 	MT792x_CLC_POWER,
-	MT792x_CLC_CHAN,
+	MT792x_CLC_POWER_EXT,
 	MT792x_CLC_MAX_NUM,
 };
 
@@ -188,7 +188,9 @@ struct mt792x_dev {
 	bool hw_init_done:1;
 	bool fw_assert:1;
 	bool has_eht:1;
+	bool regd_in_progress:1;
 	bool aspm_supported:1;
+	wait_queue_head_t wait;
 
 	struct work_struct init_work;
 
@@ -389,6 +391,7 @@ int mt792xe_mcu_fw_pmctrl(struct mt792x_dev *dev);
 int mt792x_init_acpi_sar(struct mt792x_dev *dev);
 int mt792x_init_acpi_sar_power(struct mt792x_phy *phy, bool set_default);
 u8 mt792x_acpi_get_flags(struct mt792x_phy *phy);
+u8 mt792x_acpi_get_mtcl_conf(struct mt792x_phy *phy, char *alpha2);
 #else
 static inline int mt792x_init_acpi_sar(struct mt792x_dev *dev)
 {
@@ -404,6 +407,11 @@ static inline int mt792x_init_acpi_sar_power(struct mt792x_phy *phy,
 static inline u8 mt792x_acpi_get_flags(struct mt792x_phy *phy)
 {
 	return 0;
+}
+
+static inline u8 mt792x_acpi_get_mtcl_conf(struct mt792x_phy *phy, char *alpha2)
+{
+	return 0xf;
 }
 #endif
 

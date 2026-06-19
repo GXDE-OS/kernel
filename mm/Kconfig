@@ -1300,6 +1300,17 @@ config WMARK_STEP
 	    - Apply wmark-step=3 for kthread (can be set by sysfs)
 	    - Apply wmark-step=0 for process (default, can be set to 0-5)
 
+config NUMA_MEMBLKS
+	bool
+
+config NUMA_EMU
+	bool "NUMA emulation"
+	depends on NUMA_MEMBLKS
+	help
+	  Enable NUMA emulation. A flat machine will be split
+	  into virtual nodes when booted with "numa=fake=N", where N is the
+	  number of nodes. This is only useful for debugging.
+
 source "mm/damon/Kconfig"
 
 endmenu
