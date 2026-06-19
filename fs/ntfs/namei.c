@@ -344,9 +344,9 @@ static int ntfs_sd_add_everyone(struct ntfs_inode *ni)
 	sd_len = sizeof(struct security_descriptor_relative) + 2 *
 		(sizeof(struct ntfs_sid) + 8) + sizeof(struct ntfs_acl) +
 		sizeof(struct ntfs_ace) + 4;
-	sd = kzalloc(sd_len, GFP_NOFS);
+	sd = kmalloc(sd_len, GFP_NOFS);
 	if (!sd)
-		return -ENOMEM;
+		return -1;
 
 	sd->revision = 1;
 	sd->control = SE_DACL_PRESENT | SE_SELF_RELATIVE;

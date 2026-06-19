@@ -677,11 +677,11 @@ static int ntfs_ib_read(struct ntfs_index_context *icx, s64 vcn, struct index_bl
 
 static int ntfs_icx_parent_inc(struct ntfs_index_context *icx)
 {
-	if (icx->pindex >= MAX_PARENT_VCN - 1) {
+	icx->pindex++;
+	if (icx->pindex >= MAX_PARENT_VCN) {
 		ntfs_error(icx->idx_ni->vol->sb, "Index is over %d level deep", MAX_PARENT_VCN);
 		return -EOPNOTSUPP;
 	}
-	icx->pindex++;
 	return 0;
 }
 
@@ -1978,7 +1978,6 @@ struct index_entry *ntfs_index_walk_down(struct index_entry *ie, struct ntfs_ind
 {
 	struct index_entry *entry;
 	struct index_block *ib;
-	int err;
 	s64 vcn;
 
 	entry = ie;
@@ -1988,20 +1987,14 @@ struct index_entry *ntfs_index_walk_down(struct index_entry *ie, struct ntfs_ind
 			ib = kvzalloc(ictx->block_size, GFP_NOFS);
 			if (!ib)
 				return ERR_PTR(-ENOMEM);
-			/*
-			 * Descending from root index (level 0) to the first
-			 * child level. is_in_root == true implies pindex == 0,
-			 * so advance to level 1.
-			 */
-			ictx->pindex = 1;
+			/* down from level zero */
 			ictx->ir = NULL;
 			ictx->ib = ib;
+			ictx->pindex = 1;
 			ictx->is_in_root = false;
 		} else {
 			/* down from non-zero level */
-			err = ntfs_icx_parent_inc(ictx);
-			if (err)
-				return ERR_PTR(err);
+			ictx->pindex++;
 		}
 
 		ictx->parent_pos[ictx->pindex] = 0;
