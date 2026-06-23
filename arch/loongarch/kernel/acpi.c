@@ -68,7 +68,7 @@ void acpi_add_early_pio(void)
 {
 	if (!acpi_disabled) {
 		acpi_pio = true;
-		vmap_page_range(PIO_BASE, PIO_BASE + PIO_SIZE,
+		ioremap_page_range(PIO_BASE, PIO_BASE + PIO_SIZE,
 				LOONGSON_LIO_BASE, pgprot_device(PAGE_KERNEL));
 	}
 }
