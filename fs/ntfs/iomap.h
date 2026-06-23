@@ -18,8 +18,6 @@ extern const struct iomap_ops ntfs_seek_iomap_ops;
 extern const struct iomap_ops ntfs_page_mkwrite_iomap_ops;
 extern const struct iomap_ops ntfs_dio_iomap_ops;
 extern const struct iomap_writeback_ops ntfs_writeback_ops;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
 extern const struct iomap_write_ops ntfs_iomap_folio_ops;
-#endif
 extern int ntfs_dio_zero_range(struct inode *inode, loff_t offset, loff_t length);
 #endif /* _LINUX_NTFS_IOMAP_H */

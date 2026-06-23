@@ -14,11 +14,7 @@
 #include "debug.h"
 #include "ntfs.h"
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
 #include <linux/sort.h>
-#else
-#define cmp_int(l, r) (((l) > (r)) - ((l) < (r)))
-#endif
 
 static int ntfs_collate_binary(struct ntfs_volume *vol,
 		const void *data1, const u32 data1_len,

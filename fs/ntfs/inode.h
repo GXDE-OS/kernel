@@ -10,8 +10,6 @@
 #ifndef _LINUX_NTFS_INODE_H
 #define _LINUX_NTFS_INODE_H
 
-#include <linux/version.h>
-
 #include "debug.h"
 
 enum ntfs_inode_mutex_lock_class {
@@ -116,13 +114,8 @@ struct ntfs_inode {
 	struct timespec64 i_crtime;
 	void *mrec;
 	struct mutex mrec_lock;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	struct folio *folio;
 	int folio_ofs;
-#else
-	struct page *page;
-	int page_ofs;
-#endif
 	s64 mft_lcn[2];
 	unsigned int mft_lcn_count;
 	u32 attr_list_size;
@@ -149,6 +142,8 @@ struct ntfs_inode {
 		struct ntfs_inode *base_ntfs_ino;
 	} ext;
 	unsigned int i_dealloc_clusters;
+	__le32 reparse_tag;
+	__le32 reparse_flags;
 	char *target;
 };
 
@@ -333,31 +328,11 @@ int ntfs_read_inode_mount(struct inode *vi);
 int ntfs_show_options(struct seq_file *sf, struct dentry *root);
 int ntfs_truncate_vfs(struct inode *vi, loff_t new_size, loff_t i_size);
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 int ntfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		 struct iattr *attr);
-#else
-int ntfs_setattr(struct user_namespace *mnt_userns,
-			struct dentry *dentry, struct iattr *attr);
-#endif
-#else
-int ntfs_setattr(struct dentry *dentry, struct iattr *attr);
-#endif
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 int ntfs_getattr(struct mnt_idmap *idmap, const struct path *path,
 		struct kstat *stat, unsigned int request_mask,
 		unsigned int query_flags);
-#else
-int ntfs_getattr(struct user_namespace *mnt_uerns, const struct path *path,
-		struct kstat *stat, unsigned int request_mask,
-		unsigned int query_flags);
-#endif
-#else
-int ntfs_getattr(const struct path *path, struct kstat *stat,
-		unsigned int request_mask, unsigned int query_flags);
-#endif
 
 int ntfs_get_block_mft_record(struct ntfs_inode *mft_ni, struct ntfs_inode *ni);
 int __ntfs_write_inode(struct inode *vi, int sync);

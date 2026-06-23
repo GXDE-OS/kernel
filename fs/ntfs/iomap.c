@@ -12,11 +12,6 @@
 #include "ntfs.h"
 #include "iomap.h"
 
-/*
- * iomap_zero_range is called for an area beyond the initialized size,
- * garbage values can be read, so zeroing out is needed.
- */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 static void ntfs_iomap_put_folio_non_resident(struct inode *inode, loff_t pos,
 					      unsigned int len, struct folio *folio)
 {
@@ -81,130 +76,9 @@ static void ntfs_iomap_put_folio(struct inode *inode, loff_t pos,
 	folio_put(folio);
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
 const struct iomap_write_ops ntfs_iomap_folio_ops = {
 	.put_folio = ntfs_iomap_put_folio,
 };
-#else
-const struct iomap_folio_ops ntfs_iomap_folio_ops = {
-	.put_folio = ntfs_iomap_put_folio,
-};
-#endif
-#else
-static void ntfs_zero_range_page_done(struct inode *inode, loff_t pos, unsigned int len,
-				      struct page *page)
-{
-	struct ntfs_inode *ni = NTFS_I(inode);
-	unsigned long sector_size = 1UL << inode->i_blkbits;
-	loff_t start_down, end_up, init;
-
-	if (len == 0)
-		return;
-	if (!NInoNonResident(ni))
-		return;
-
-	start_down = round_down(pos, sector_size);
-	end_up = (pos + len - 1) | (sector_size - 1);
-	init = ni->initialized_size;
-
-	if (init >= start_down && init <= end_up) {
-		if (init < pos) {
-			loff_t offset = offset_in_page(pos + len);
-
-			if (offset == 0)
-				offset = PAGE_SIZE;
-			lock_page(page);
-			zero_user_segments(page,
-					   offset_in_page(init),
-					   offset_in_page(pos),
-					   offset,
-					   PAGE_SIZE);
-			unlock_page(page);
-
-		} else  {
-			loff_t offset = max_t(loff_t, pos + len, init);
-
-			offset = offset_in_page(offset);
-			if (offset == 0)
-				offset = PAGE_SIZE;
-			lock_page(page);
-			zero_user_segment(page,
-					  offset,
-					  PAGE_SIZE);
-			unlock_page(page);
-		}
-	} else if (init <= pos) {
-		loff_t offset = 0, offset2 = offset_in_page(pos + len);
-
-		if ((init >> PAGE_SHIFT) == (pos >> PAGE_SHIFT))
-			offset = offset_in_page(init);
-		if (offset2 == 0)
-			offset2 = PAGE_SIZE;
-		lock_page(page);
-		zero_user_segments(page,
-				   offset,
-				   offset_in_page(pos),
-				   offset2,
-				   PAGE_SIZE);
-		unlock_page(page);
-	}
-}
-
-static struct iomap_page_ops ntfs_zero_range_page_ops = {
-	.page_done = ntfs_zero_range_page_done,
-};
-#endif
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
-/*
- * Check that the cached iomap still matches the NTFS runlist before
- * iomap_zero_range() is called. if the runlist changes while iomap is
- * iterating a cached iomap, iomap_zero_range() may overwrite folios
- * that have been already written with valid data.
- */
-static bool ntfs_iomap_valid(struct inode *inode, const struct iomap *iomap)
-{
-	struct ntfs_inode *ni = NTFS_I(inode);
-	struct runlist_element *rl;
-	s64 vcn, lcn;
-
-	if (!NInoNonResident(ni))
-		return false;
-
-	vcn = iomap->offset >> ni->vol->cluster_size_bits;
-
-	down_read(&ni->runlist.lock);
-	rl = __ntfs_attr_find_vcn_nolock(&ni->runlist, vcn);
-	if (IS_ERR(rl)) {
-		up_read(&ni->runlist.lock);
-		return false;
-	}
-	lcn = ntfs_rl_vcn_to_lcn(rl, vcn);
-	up_read(&ni->runlist.lock);
-	return lcn == LCN_DELALLOC;
-}
-#endif
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
-static const struct iomap_write_ops ntfs_zero_iomap_folio_ops = {
-	.put_folio = ntfs_iomap_put_folio,
-	.iomap_valid = ntfs_iomap_valid,
-};
-#else
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
-static const struct iomap_folio_ops ntfs_zero_iomap_folio_ops = {
-	.put_folio = ntfs_iomap_put_folio,
-	.iomap_valid = ntfs_iomap_valid,
-};
-#else
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
-static const struct iomap_page_ops ntfs_zero_iomap_page_ops = {
-	.page_done = ntfs_zero_range_page_done,
-	.iomap_valid = ntfs_iomap_valid,
-};
-#endif
-#endif
-#endif
 
 static int ntfs_read_iomap_begin_resident(struct inode *inode, loff_t offset, loff_t length,
 		unsigned int flags, struct iomap *iomap)
@@ -317,15 +191,9 @@ out:
  *
  * Return: 0 on success, negative error code on failure.
  */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 17, 0)
-static int ntfs_read_iomap_begin_non_resident(struct inode *inode, loff_t offset,
-		loff_t length, unsigned int flags, struct iomap *iomap,
-		bool for_clu_zero, bool need_unwritten)
-#else
 static int ntfs_read_iomap_begin_non_resident(struct inode *inode, loff_t offset,
 		loff_t length, unsigned int flags, struct iomap *iomap,
 		bool need_unwritten)
-#endif
 {
 	struct ntfs_inode *ni = NTFS_I(inode);
 	s64 vcn;
@@ -395,51 +263,27 @@ static int ntfs_read_iomap_begin_non_resident(struct inode *inode, loff_t offset
 		iomap->length = round_up(ni->initialized_size, 1 << inode->i_blkbits) -
 			iomap->offset;
 	}
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 17, 0)
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
-		if (flags & IOMAP_ZERO) {
-			if (for_clu_zero)
-				iomap->folio_ops = &ntfs_zero_iomap_folio_ops;
-			else
-				iomap->folio_ops = &ntfs_iomap_folio_ops;
-		}
-#else
-		if (flags & IOMAP_ZERO) {
-			if (for_clu_zero)
-				iomap->page_ops = &ntfs_zero_iomap_page_ops;
-			else
-				iomap->page_ops = &ntfs_zero_range_page_ops;
-		}
-#endif
-#endif
 	iomap->flags |= IOMAP_F_MERGED;
 
 	return 0;
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
 static int __ntfs_read_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 		unsigned int flags, struct iomap *iomap, struct iomap *srcmap,
 		bool need_unwritten)
-#else
-static int __ntfs_read_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
-		unsigned int flags, struct iomap *iomap, struct iomap *srcmap,
-		bool for_clu_zero, bool need_unwritten)
-#endif
 {
 	if (NInoNonResident(NTFS_I(inode)))
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 17, 0)
 		return ntfs_read_iomap_begin_non_resident(inode, offset, length,
-							  flags, iomap, for_clu_zero,
-							  need_unwritten);
-#else
-		return ntfs_read_iomap_begin_non_resident(inode, offset, length,
-							  flags, iomap, need_unwritten);
-#endif
-	else
-		return ntfs_read_iomap_begin_resident(inode, offset, length,
-						      flags, iomap);
+				flags, iomap, need_unwritten);
+	return ntfs_read_iomap_begin_resident(inode, offset, length,
+					     flags, iomap);
+}
+
+static int ntfs_read_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
+		unsigned int flags, struct iomap *iomap, struct iomap *srcmap)
+{
+	return __ntfs_read_iomap_begin(inode, offset, length, flags, iomap,
+			srcmap, true);
 }
 
 static int ntfs_read_iomap_end(struct inode *inode, loff_t pos, loff_t length,
@@ -454,21 +298,43 @@ static int ntfs_read_iomap_end(struct inode *inode, loff_t pos, loff_t length,
 	return written;
 }
 
-static int ntfs_zero_read_iomap_end(struct inode *inode, loff_t pos, loff_t length,
-		ssize_t written, unsigned int flags, struct iomap *iomap)
+const struct iomap_ops ntfs_read_iomap_ops = {
+	.iomap_begin = ntfs_read_iomap_begin,
+	.iomap_end = ntfs_read_iomap_end,
+};
+
+/*
+ * Check that the cached iomap still matches the NTFS runlist before
+ * iomap_zero_range() is called. if the runlist changes while iomap is
+ * iterating a cached iomap, iomap_zero_range() may overwrite folios
+ * that have been already written with valid data.
+ */
+static bool ntfs_iomap_valid(struct inode *inode, const struct iomap *iomap)
 {
-	if ((flags & IOMAP_ZERO) && (iomap->flags & IOMAP_F_STALE))
-		return -EPERM;
-	return written;
+	struct ntfs_inode *ni = NTFS_I(inode);
+	struct runlist_element *rl;
+	s64 vcn, lcn;
+
+	if (!NInoNonResident(ni))
+		return false;
+
+	vcn = iomap->offset >> ni->vol->cluster_size_bits;
+
+	down_read(&ni->runlist.lock);
+	rl = __ntfs_attr_find_vcn_nolock(&ni->runlist, vcn);
+	if (IS_ERR(rl)) {
+		up_read(&ni->runlist.lock);
+		return false;
+	}
+	lcn = ntfs_rl_vcn_to_lcn(rl, vcn);
+	up_read(&ni->runlist.lock);
+	return lcn == LCN_DELALLOC;
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
-static int ntfs_read_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
-		unsigned int flags, struct iomap *iomap, struct iomap *srcmap)
-{
-	return __ntfs_read_iomap_begin(inode, offset, length, flags, iomap,
-			srcmap, true);
-}
+static const struct iomap_write_ops ntfs_zero_iomap_folio_ops = {
+	.put_folio = ntfs_iomap_put_folio,
+	.iomap_valid = ntfs_iomap_valid,
+};
 
 static int ntfs_seek_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 		unsigned int flags, struct iomap *iomap, struct iomap *srcmap)
@@ -477,44 +343,17 @@ static int ntfs_seek_iomap_begin(struct inode *inode, loff_t offset, loff_t leng
 			srcmap, false);
 }
 
+static int ntfs_zero_read_iomap_end(struct inode *inode, loff_t pos, loff_t length,
+		ssize_t written, unsigned int flags, struct iomap *iomap)
+{
+	if ((flags & IOMAP_ZERO) && (iomap->flags & IOMAP_F_STALE))
+		return -EPERM;
+	return written;
+}
 
 static const struct iomap_ops ntfs_zero_read_iomap_ops = {
 	.iomap_begin = ntfs_seek_iomap_begin,
 	.iomap_end = ntfs_zero_read_iomap_end,
-};
-#else
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
-static int ntfs_zero_read_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
-		unsigned int flags, struct iomap *iomap, struct iomap *srcmap)
-{
-	return __ntfs_read_iomap_begin(inode, offset, length, flags, iomap, srcmap,
-				       true, false);
-}
-
-static int ntfs_read_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
-		unsigned int flags, struct iomap *iomap, struct iomap *srcmap)
-{
-	return __ntfs_read_iomap_begin(inode, offset, length, flags, iomap, srcmap,
-				       false, true);
-}
-
-static int ntfs_seek_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
-		unsigned int flags, struct iomap *iomap, struct iomap *srcmap)
-{
-	return __ntfs_read_iomap_begin(inode, offset, length, flags, iomap, srcmap,
-				       false, false);
-}
-
-static const struct iomap_ops ntfs_zero_read_iomap_ops = {
-	.iomap_begin = ntfs_zero_read_iomap_begin,
-	.iomap_end = ntfs_zero_read_iomap_end,
-};
-#endif
-#endif
-
-const struct iomap_ops ntfs_read_iomap_ops = {
-	.iomap_begin = ntfs_read_iomap_begin,
-	.iomap_end = ntfs_read_iomap_end,
 };
 
 const struct iomap_ops ntfs_seek_iomap_ops = {
@@ -536,27 +375,12 @@ int ntfs_dio_zero_range(struct inode *inode, loff_t offset, loff_t length)
 
 static int ntfs_zero_range(struct inode *inode, loff_t offset, loff_t length)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
 	return iomap_zero_range(inode,
 				offset, length,
 				NULL,
 				&ntfs_zero_read_iomap_ops,
 				&ntfs_zero_iomap_folio_ops,
 				NULL);
-#else
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
-	return iomap_zero_range(inode,
-				offset, length,
-				NULL,
-				&ntfs_zero_read_iomap_ops,
-				NULL);
-#else
-	return iomap_zero_range(inode,
-				offset, length,
-				NULL,
-				&ntfs_zero_read_iomap_ops);
-#endif
-#endif
 }
 
 static int ntfs_write_simple_iomap_begin_non_resident(struct inode *inode, loff_t offset,
@@ -732,14 +556,6 @@ remap_rl:
 			iomap->length = rl_length - vcn_ofs;
 		else
 			iomap->length = length;
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 17, 0)
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
-		iomap->folio_ops = &ntfs_iomap_folio_ops;
-#else
-		iomap->page_ops = &ntfs_zero_range_page_ops;
-#endif
-#endif
 	}
 
 	return 0;
@@ -1042,7 +858,6 @@ const struct iomap_ops ntfs_dio_iomap_ops = {
 	.iomap_end		= ntfs_write_iomap_end,
 };
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
 static ssize_t ntfs_writeback_range(struct iomap_writepage_ctx *wpc,
 		struct folio *folio, u64 offset, unsigned int len, u64 end_pos)
 {
@@ -1065,31 +880,3 @@ const struct iomap_writeback_ops ntfs_writeback_ops = {
 	.writeback_range	= ntfs_writeback_range,
 	.writeback_submit	= iomap_ioend_writeback_submit,
 };
-#else
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 9, 0)
-static int ntfs_write_map_blocks(struct iomap_writepage_ctx *wpc,
-		struct inode *inode, loff_t offset, unsigned int len)
-#else
-static int ntfs_write_map_blocks(struct iomap_writepage_ctx *wpc,
-		struct inode *inode, loff_t offset)
-#endif
-{
-	/* If the mapping is already OK, nothing needs to be done */
-	if (offset >= wpc->iomap.offset &&
-	    offset < wpc->iomap.offset + wpc->iomap.length)
-		return 0;
-
-	return __ntfs_write_iomap_begin(inode, offset,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 9, 0)
-					NTFS_I(inode)->allocated_size - offset,
-#else
-					NTFS_I(inode)->data_size - offset,
-#endif
-					IOMAP_WRITE, &wpc->iomap,
-					NTFS_IOMAP_FLAGS_WRITEBACK);
-}
-
-const struct iomap_writeback_ops ntfs_writeback_ops = {
-	.map_blocks		= ntfs_write_map_blocks,
-};
-#endif

@@ -72,8 +72,7 @@ int ntfs_mft_record_check(const struct ntfs_volume *vol, struct mft_record *m,
 
 	if (attrs_offset > bytes_in_use ||
 	    bytes_in_use - attrs_offset < sizeof_field(struct attr_record, type)) {
-		ntfs_error(sb, "Record %llu has corrupt attribute offset\n",
-				mft_no);
+		ntfs_error(sb, "Record %llu has corrupt attribute offset\n", mft_no);
 		goto err_out;
 	}
 
@@ -107,28 +106,16 @@ err_out:
  * The return value needs to be checked with IS_ERR(). If it is true,
  * PTR_ERR() contains the negative error code.
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 static inline struct mft_record *map_mft_record_folio(struct ntfs_inode *ni)
-#else
-static inline struct mft_record *map_mft_record_page(struct ntfs_inode *ni)
-#endif
 {
 	loff_t i_size;
 	struct ntfs_volume *vol = ni->vol;
 	struct inode *mft_vi = vol->mft_ino;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	struct folio *folio;
-#else
-	struct page *page;
-#endif
 	unsigned long index, end_index;
 	unsigned int ofs;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	WARN_ON(ni->folio);
-#else
-	WARN_ON(ni->page);
-#endif
 	/*
 	 * The index into the page cache and the offset within the page cache
 	 * page of the wanted mft record.
@@ -144,11 +131,7 @@ static inline struct mft_record *map_mft_record_page(struct ntfs_inode *ni)
 	if (unlikely(index >= end_index)) {
 		if (index > end_index || (i_size & ~PAGE_MASK) < ofs +
 				vol->mft_record_size) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 			folio = ERR_PTR(-ENOENT);
-#else
-			page = ERR_PTR(-ENOENT);
-#endif
 			ntfs_error(vol->sb,
 				"Attempt to read mft record 0x%llx, which is beyond the end of the mft. This is probably a bug in the ntfs driver.",
 				ni->mft_no);
@@ -157,7 +140,6 @@ static inline struct mft_record *map_mft_record_page(struct ntfs_inode *ni)
 	}
 
 	/* Read, map, and pin the folio. */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	folio = read_mapping_folio(mft_vi->i_mapping, index, NULL);
 	if (!IS_ERR(folio)) {
 		u8 *addr;
@@ -191,39 +173,6 @@ err_out:
 	ni->folio = NULL;
 	ni->folio_ofs = 0;
 	return (struct mft_record *)folio;
-#else
-	page = read_mapping_page(mft_vi->i_mapping, index, NULL);
-	if (!IS_ERR(page)) {
-		ni->mrec = kmalloc(vol->mft_record_size, GFP_NOFS);
-		if (!ni->mrec) {
-			kunmap(page);
-			put_page(page);
-			page = ERR_PTR(-ENOMEM);
-			goto err_out;
-		}
-
-		memcpy(ni->mrec, page_address(page) + ofs, vol->mft_record_size);
-		post_read_mst_fixup((struct ntfs_record *)ni->mrec, vol->mft_record_size);
-
-		/* Catch multi sector transfer fixup errors. */
-		if (!ntfs_mft_record_check(vol, (struct mft_record *)ni->mrec, ni->mft_no)) {
-			ni->page = page;
-			ni->page_ofs = ofs;
-			return ni->mrec;
-		}
-		kunmap(page);
-		put_page(page);
-
-		kfree(ni->mrec);
-		ni->mrec = NULL;
-		page = ERR_PTR(-EIO);
-		NVolSetErrors(vol);
-	}
-err_out:
-	ni->page = NULL;
-	ni->page_ofs = 0;
-	return (struct mft_record *)page;
-#endif
 }
 
 /*
@@ -256,17 +205,10 @@ struct mft_record *map_mft_record(struct ntfs_inode *ni)
 	/* Make sure the ntfs inode doesn't go away. */
 	atomic_inc(&ni->count);
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	if (ni->folio)
 		return (struct mft_record *)ni->mrec;
 
 	m = map_mft_record_folio(ni);
-#else
-	if (ni->page)
-		return (struct mft_record *)ni->mrec;
-
-	m = map_mft_record_page(ni);
-#endif
 	if (!IS_ERR(m))
 		return m;
 
@@ -291,7 +233,6 @@ struct mft_record *map_mft_record(struct ntfs_inode *ni)
  */
 void unmap_mft_record(struct ntfs_inode *ni)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	struct folio *folio;
 
 	if (!ni)
@@ -303,19 +244,6 @@ void unmap_mft_record(struct ntfs_inode *ni)
 	if (atomic_dec_return(&ni->count) > 1)
 		return;
 	WARN_ON(!folio);
-#else
-	struct page *page;
-
-	if (!ni)
-		return;
-
-	ntfs_debug("Entering for mft_no 0x%llx.", ni->mft_no);
-
-	page = ni->page;
-	if (atomic_dec_return(&ni->count) > 1)
-		return;
-	WARN_ON(!page);
-#endif
 }
 
 /*
@@ -510,13 +438,8 @@ void __mark_mft_record_dirty(struct ntfs_inode *ni)
  */
 static void ntfs_bio_end_io(struct bio *bio)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	if (bio->bi_private)
 		folio_put((struct folio *)bio->bi_private);
-#else
-	if (bio->bi_private)
-		put_page((struct page *)bio->bi_private);
-#endif
 	bio_put(bio);
 }
 
@@ -538,13 +461,8 @@ int ntfs_sync_mft_mirror(struct ntfs_volume *vol, const u64 mft_no,
 		struct mft_record *m)
 {
 	u8 *kmirr;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	struct folio *folio;
 	unsigned int folio_ofs, lcn_folio_off = 0;
-#else
-	struct page *page;
-	unsigned int page_ofs, lcn_page_off = 0;
-#endif
 	int err = 0;
 	struct bio *bio;
 
@@ -555,8 +473,6 @@ int ntfs_sync_mft_mirror(struct ntfs_volume *vol, const u64 mft_no,
 		err = -EIO;
 		goto err_out;
 	}
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	/* Get the page containing the mirror copy of the mft record @m. */
 	folio = read_mapping_folio(vol->mftmirr_ino->i_mapping,
 			NTFS_MFT_NR_TO_PIDX(vol, mft_no), NULL);
@@ -575,70 +491,21 @@ int ntfs_sync_mft_mirror(struct ntfs_volume *vol, const u64 mft_no,
 	/* Copy the mst protected mft record to the mirror. */
 	memcpy(kmirr, m, vol->mft_record_size);
 	kunmap_local(kmirr);
-#else
 
-	/* Get the page containing the mirror copy of the mft record @m. */
-	page = read_mapping_page(vol->mftmirr_ino->i_mapping, mft_no >>
-			(PAGE_SHIFT - vol->mft_record_size_bits), NULL);
-	if (IS_ERR(page)) {
-		ntfs_error(vol->sb, "Failed to map mft mirror page.");
-		err = PTR_ERR(page);
-		goto err_out;
-	}
-	lock_page(page);
-	BUG_ON(!PageUptodate(page));
-	ClearPageUptodate(page);
-	/* Offset of the mft mirror record inside the page. */
-	page_ofs = (mft_no << vol->mft_record_size_bits) & ~PAGE_MASK;
-	/* The address in the page of the mirror copy of the mft record @m. */
-	kmirr = page_address(page) + page_ofs;
-	/* Copy the mst protected mft record to the mirror. */
-	memcpy(kmirr, m, vol->mft_record_size);
-#endif
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	if (vol->cluster_size_bits > PAGE_SHIFT) {
 		lcn_folio_off = folio->index << PAGE_SHIFT;
 		lcn_folio_off &= vol->cluster_size_mask;
 	}
-#else
-	if (vol->cluster_size_bits > PAGE_SHIFT) {
-		lcn_page_off = page->index << PAGE_SHIFT;
-		lcn_page_off &= vol->cluster_size_mask;
-	}
-#endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
 	bio = bio_alloc(vol->sb->s_bdev, 1, REQ_OP_WRITE, GFP_NOIO);
-#else
-	bio = bio_alloc(GFP_NOIO, 1);
-	if (!bio)
-		return NULL;
-	bio_set_dev(bio, vol->sb->s_bdev);
-	bio->bi_opf = REQ_OP_WRITE;
-#endif
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	bio->bi_iter.bi_sector =
 		NTFS_B_TO_SECTOR(vol, NTFS_CLU_TO_B(vol, vol->mftmirr_lcn) +
 				 lcn_folio_off + folio_ofs);
-#else
-	bio->bi_iter.bi_sector =
-		NTFS_B_TO_SECTOR(vol, NTFS_CLU_TO_B(vol, vol->mftmirr_lcn) +
-				 lcn_page_off + page_ofs);
-#endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	if (bio_add_folio(bio, folio, vol->mft_record_size, folio_ofs))
 		err = submit_bio_wait(bio);
 	else
 		err = -EIO;
-#else
-	if (bio_add_page(bio, page, vol->mft_record_size, page_ofs))
-		err = submit_bio_wait(bio);
-	else
-		err = -EIO;
-#endif
 	bio_put(bio);
 
 	/*
@@ -648,18 +515,10 @@ int ntfs_sync_mft_mirror(struct ntfs_volume *vol, const u64 mft_no,
 	 * the stale on-disk mirror and overwrite this copy.  The error is
 	 * propagated to the caller via @err.
 	 */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	folio_mark_uptodate(folio);
 
 	folio_unlock(folio);
 	folio_put(folio);
-#else
-	/* Current state: all buffers are clean, unlocked, and uptodate. */
-	SetPageUptodate(page);
-	unlock_page(page);
-	put_page(page);
-#endif
-
 	if (likely(!err)) {
 		ntfs_debug("Done.");
 	} else {
@@ -692,11 +551,7 @@ err_out:
 int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int sync)
 {
 	struct ntfs_volume *vol = ni->vol;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	struct folio *folio = ni->folio;
-#else
-	struct page *page = ni->page;
-#endif
 	int err = 0, i = 0;
 	u8 *kaddr;
 	struct mft_record *fixup_m;
@@ -706,11 +561,7 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 	ntfs_debug("Entering for inode 0x%llx.", ni->mft_no);
 
 	WARN_ON(NInoAttr(ni));
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	WARN_ON(!folio_test_locked(folio));
-#else
-	WARN_ON(!PageLocked(page));
-#endif
 
 	/*
 	 * If the struct ntfs_inode is clean no need to do anything.  If it is dirty,
@@ -721,13 +572,8 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 	if (!NInoTestClearDirty(ni))
 		goto done;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	kaddr = kmap_local_folio(folio, 0);
 	fixup_m = (struct mft_record *)(kaddr + ni->folio_ofs);
-#else
-	kaddr = kmap(page);
-	fixup_m = (struct mft_record *)(kaddr + ni->page_ofs);
-#endif
 	memcpy(fixup_m, m, vol->mft_record_size);
 
 	/* Apply the mst protection fixups. */
@@ -744,7 +590,6 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 		clu_off = (unsigned int)((s64)ni->mft_no * vol->mft_record_size + offset) &
 			vol->cluster_size_mask;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 		bio = bio_alloc(vol->sb->s_bdev, 1, REQ_OP_WRITE, GFP_NOIO);
 		bio->bi_iter.bi_sector =
 			NTFS_B_TO_SECTOR(vol, NTFS_CLU_TO_B(vol, ni->mft_lcn[i]) +
@@ -755,22 +600,6 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 			err = -EIO;
 			goto put_bio_out;
 		}
-#else
-		bio = bio_alloc(vol->sb->s_bdev, 1, REQ_OP_WRITE, GFP_NOIO);
-		bio->bi_iter.bi_sector =
-			NTFS_B_TO_SECTOR(vol, NTFS_CLU_TO_B(vol, ni->mft_lcn[i]) +
-					 clu_off);
-		if (!bio) {
-			err = -ENOMEM;
-			goto err_out;
-		}
-
-		if (!bio_add_page(bio, page, folio_size,
-				  ni->page_ofs + offset)) {
-			err = -EIO;
-			goto put_bio_out;
-		}
-#endif
 
 		/* Synchronize the mft mirror now if not @sync. */
 		if (!sync && ni->mft_no < vol->mftmirr_size) {
@@ -787,13 +616,8 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 			if (unlikely(sub_err) && !err)
 				err = sub_err;
 		} else {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 			folio_get(folio);
 			bio->bi_private = folio;
-#else
-			get_page(page);
-			bio->bi_private = page;
-#endif
 			bio->bi_end_io = ntfs_bio_end_io;
 			submit_bio(bio);
 		}
@@ -808,11 +632,7 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 		if (unlikely(sub_err) && !err)
 			err = sub_err;
 	}
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	kunmap_local(kaddr);
-#else
-	kunmap(page);
-#endif
 	if (unlikely(err)) {
 		/* I/O error during writing.  This is really bad! */
 		ntfs_error(vol->sb,
@@ -842,11 +662,7 @@ err_out:
 	return err;
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
-static int ntfs_test_inode_wb(struct inode *vi, u64 ino, void *data)
-#else
 static int ntfs_test_inode_wb(struct inode *vi, unsigned long ino, void *data)
-#endif
 {
 	struct ntfs_attr *na = data;
 
@@ -931,23 +747,6 @@ static int ntfs_test_inode_wb(struct inode *vi, unsigned long ino, void *data)
  *
  * If the mft record is not a FILE record or it is a base mft record, we can
  * safely write it and return 'true'.
- *
- * We now know the mft record is an extent mft record.  We check if the inode
- * corresponding to its base mft record is in icache. If it is not, we cannot
- * safely determine the state of the extent inode, so we return 'false'.
- *
- * We now have the base inode for the extent mft record.  We check if it has an
- * ntfs inode for the extent mft record attached. If not, it is safe to write
- * the extent mft record and we return 'true'.
- *
- * If the extent inode is attached, we check if it is dirty. If so, we return
- * 'false' (letting the standard write_inode path handle it).
- *
- * If it is not dirty, we attempt to lock the extent mft record. If the lock
- * was already taken, it is not safe to write and we return 'false'.
- *
- * If we manage to obtain the lock we have exclusive access to the extent mft
- * record. We set @locked_ni to the now locked ntfs inode and return 'true'.
  */
 static bool ntfs_may_write_mft_record(struct ntfs_volume *vol, const u64 mft_no,
 		const struct mft_record *m, struct ntfs_inode **locked_ni,
@@ -956,8 +755,7 @@ static bool ntfs_may_write_mft_record(struct ntfs_volume *vol, const u64 mft_no,
 	struct super_block *sb = vol->sb;
 	struct inode *mft_vi = vol->mft_ino;
 	struct inode *vi;
-	struct ntfs_inode *ni, *eni, **extent_nis;
-	int i;
+	struct ntfs_inode *ni;
 	struct ntfs_attr na = {0};
 
 	ntfs_debug("Entering for inode 0x%llx.", mft_no);
@@ -1037,100 +835,10 @@ static bool ntfs_may_write_mft_record(struct ntfs_volume *vol, const u64 mft_no,
 				mft_no);
 		return true;
 	}
-	/*
-	 * This is an extent mft record.  Check if the inode corresponding to
-	 * its base mft record is in icache and obtain a reference to it if it
-	 * is.
-	 */
-	na.mft_no = MREF_LE(m->base_mft_record);
-	na.state = 0;
-	ntfs_debug("Mft record 0x%llx is an extent record.  Looking for base inode 0x%llx in icache.",
-			mft_no, na.mft_no);
-	if (!na.mft_no) {
-		/* Balance the below iput(). */
-		vi = igrab(mft_vi);
-		WARN_ON(vi != mft_vi);
-	} else {
-		vi = find_inode_nowait(sb, na.mft_no, ntfs_test_inode_wb, &na);
-		if (na.state == NI_BeingDeleted || na.state == NI_BeingCreated)
-			return false;
-	}
 
-	if (!vi)
-		return false;
-	ntfs_debug("Base inode 0x%llx is in icache.", na.mft_no);
-	/*
-	 * The base inode is in icache.  Check if it has the extent inode
-	 * corresponding to this extent mft record attached.
-	 */
-	ni = NTFS_I(vi);
-	mutex_lock(&ni->extent_lock);
-	if (ni->nr_extents <= 0) {
-		/*
-		 * The base inode has no attached extent inodes, write this
-		 * extent mft record.
-		 */
-		mutex_unlock(&ni->extent_lock);
-		*ref_vi = vi;
-		ntfs_debug("Base inode 0x%llx has no attached extent inodes, write the extent record.",
-				na.mft_no);
-		return true;
-	}
-	/* Iterate over the attached extent inodes. */
-	extent_nis = ni->ext.extent_ntfs_inos;
-	for (eni = NULL, i = 0; i < ni->nr_extents; ++i) {
-		if (mft_no == extent_nis[i]->mft_no) {
-			/*
-			 * Found the extent inode corresponding to this extent
-			 * mft record.
-			 */
-			eni = extent_nis[i];
-			break;
-		}
-	}
-	/*
-	 * If the extent inode was not attached to the base inode, write this
-	 * extent mft record.
-	 */
-	if (!eni) {
-		mutex_unlock(&ni->extent_lock);
-		*ref_vi = vi;
-		ntfs_debug("Extent inode 0x%llx is not attached to its base inode 0x%llx, write the extent record.",
-				mft_no, na.mft_no);
-		return true;
-	}
-	ntfs_debug("Extent inode 0x%llx is attached to its base inode 0x%llx.",
-			mft_no, na.mft_no);
-	/* Take a reference to the extent ntfs inode. */
-	atomic_inc(&eni->count);
-	mutex_unlock(&ni->extent_lock);
-
-	/* if extent inode is dirty, write_inode will write it */
-	if (NInoDirty(eni)) {
-		atomic_dec(&eni->count);
-		*ref_vi = vi;
-		return false;
-	}
-
-	/*
-	 * Found the extent inode coresponding to this extent mft record.
-	 * Try to take the mft record lock.
-	 */
-	if (unlikely(!mutex_trylock(&eni->mrec_lock))) {
-		atomic_dec(&eni->count);
-		*ref_vi = vi;
-		ntfs_debug("Extent mft record 0x%llx is already locked, do not write it.",
-				mft_no);
-		return false;
-	}
-	ntfs_debug("Managed to lock extent mft record 0x%llx, write it.",
-			mft_no);
-	/*
-	 * The write has to occur while we hold the mft record lock so return
-	 * the locked extent ntfs inode.
-	 */
-	*locked_ni = eni;
-	return true;
+	ntfs_debug("Mft record 0x%llx is an extent record, skip it.",
+		   mft_no);
+	return false;
 }
 
 static const char *es = "  Leaving inconsistent metadata.  Unmount and run chkdsk.";
@@ -1163,13 +871,8 @@ static s64 ntfs_mft_bitmap_find_and_alloc_free_rec_nolock(struct ntfs_volume *vo
 	unsigned long flags;
 	struct address_space *mftbmp_mapping;
 	u8 *buf = NULL, *byte;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	struct folio *folio;
 	unsigned int folio_ofs, size;
-#else
-	struct page *page;
-	unsigned int page_ofs, size;
-#endif
 	u8 pass, b;
 
 	ntfs_debug("Searching for free mft record in the currently initialized mft bitmap.");
@@ -1214,13 +917,8 @@ static s64 ntfs_mft_bitmap_find_and_alloc_free_rec_nolock(struct ntfs_volume *vo
 	for (; pass <= 2;) {
 		/* Cap size to pass_end. */
 		ofs = data_pos >> 3;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 		folio_ofs = ofs & ~PAGE_MASK;
 		size = PAGE_SIZE - folio_ofs;
-#else
-		page_ofs = ofs & ~PAGE_MASK;
-		size = PAGE_SIZE - page_ofs;
-#endif
 		ll = ((pass_end + 7) >> 3) - ofs;
 		if (size > ll)
 			size = ll;
@@ -1230,7 +928,6 @@ static s64 ntfs_mft_bitmap_find_and_alloc_free_rec_nolock(struct ntfs_volume *vo
 		 * for a zero bit.
 		 */
 		if (size) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 			folio = read_mapping_folio(mftbmp_mapping,
 					ofs >> PAGE_SHIFT, NULL);
 			if (IS_ERR(folio)) {
@@ -1239,15 +936,6 @@ static s64 ntfs_mft_bitmap_find_and_alloc_free_rec_nolock(struct ntfs_volume *vo
 			}
 			folio_lock(folio);
 			buf = (u8 *)kmap_local_folio(folio, 0) + folio_ofs;
-#else
-			page = read_mapping_page(mftbmp_mapping, ofs >> PAGE_SHIFT, NULL);
-			if (IS_ERR(page)) {
-				ntfs_error(vol->sb, "Failed to read mft bitmap, aborting.");
-				return PTR_ERR(page);
-			}
-			lock_page(page);
-			buf = (u8 *)page_address(page) + page_ofs;
-#endif
 			bit = data_pos & 7;
 			data_pos &= ~7ull;
 			ntfs_debug("Before inner for loop: size 0x%x, data_pos 0x%llx, bit 0x%llx",
@@ -1260,16 +948,9 @@ static s64 ntfs_mft_bitmap_find_and_alloc_free_rec_nolock(struct ntfs_volume *vo
 				 * no guarantee that the found record will be accessible.
 				 */
 				if (base_ni && base_ni->mft_no == FILE_MFT && bit > 400) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 					folio_unlock(folio);
 					kunmap_local(buf);
 					folio_put(folio);
-#else
-					unlock_page(page);
-					kunmap(page);
-					put_page(page);
-#endif
-
 					return -ENOSPC;
 				}
 
@@ -1280,29 +961,16 @@ static s64 ntfs_mft_bitmap_find_and_alloc_free_rec_nolock(struct ntfs_volume *vo
 				if (b < 8 && b >= (bit & 7)) {
 					ll = data_pos + (bit & ~7ull) + b;
 					if (unlikely(ll >= (1ll << 32))) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 						folio_unlock(folio);
 						kunmap_local(buf);
 						folio_put(folio);
-#else
-						unlock_page(page);
-						kunmap(page);
-						put_page(page);
-#endif
 						return -ENOSPC;
 					}
 					*byte |= 1 << b;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 					folio_mark_dirty(folio);
 					folio_unlock(folio);
 					kunmap_local(buf);
 					folio_put(folio);
-#else
-					set_page_dirty(page);
-					unlock_page(page);
-					kunmap(page);
-					put_page(page);
-#endif
 					ntfs_debug("Done.  (Found and allocated mft record 0x%llx.)",
 							ll);
 					return ll;
@@ -1311,15 +979,9 @@ static s64 ntfs_mft_bitmap_find_and_alloc_free_rec_nolock(struct ntfs_volume *vo
 			ntfs_debug("After inner for loop: size 0x%x, data_pos 0x%llx, bit 0x%llx",
 					size, data_pos, bit);
 			data_pos += size;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 			folio_unlock(folio);
 			kunmap_local(buf);
 			folio_put(folio);
-#else
-			unlock_page(page);
-			kunmap(page);
-			put_page(page);
-#endif
 			/*
 			 * If the end of the pass has not been reached yet,
 			 * continue searching the mft bitmap for a zero bit.
@@ -1397,11 +1059,7 @@ static int ntfs_mft_bitmap_extend_allocation_nolock(struct ntfs_volume *vol)
 	s64 lcn;
 	s64 ll;
 	unsigned long flags;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	struct folio *folio;
-#else
-	struct page *page;
-#endif
 	struct ntfs_inode *mft_ni, *mftbmp_ni;
 	struct runlist_element *rl, *rl2 = NULL;
 	struct ntfs_attr_search_ctx *ctx = NULL;
@@ -1450,7 +1108,6 @@ static int ntfs_mft_bitmap_extend_allocation_nolock(struct ntfs_volume *vol)
 	 * to us.
 	 */
 	ll = lcn >> 3;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	folio = read_mapping_folio(vol->lcnbmp_ino->i_mapping,
 			ll >> PAGE_SHIFT, NULL);
 	if (IS_ERR(folio)) {
@@ -1462,34 +1119,14 @@ static int ntfs_mft_bitmap_extend_allocation_nolock(struct ntfs_volume *vol)
 	down_write(&vol->lcnbmp_lock);
 	folio_lock(folio);
 	b = (u8 *)kmap_local_folio(folio, 0) + (ll & ~PAGE_MASK);
-#else
-	page = read_mapping_page(vol->lcnbmp_ino->i_mapping,
-			ll >> PAGE_SHIFT, NULL);
-	if (IS_ERR(page)) {
-		up_write(&mftbmp_ni->runlist.lock);
-		ntfs_error(vol->sb, "Failed to read from lcn bitmap.");
-		return PTR_ERR(page);
-	}
-
-	down_write(&vol->lcnbmp_lock);
-	lock_page(page);
-	b = (u8 *)page_address(page) + (ll & ~PAGE_MASK);
-#endif
 	tb = 1 << (lcn & 7ull);
 	if (*b != 0xff && !(*b & tb)) {
 		/* Next cluster is free, allocate it. */
 		*b |= tb;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 		folio_mark_dirty(folio);
 		folio_unlock(folio);
 		kunmap_local(b);
 		folio_put(folio);
-#else
-		set_page_dirty(page);
-		unlock_page(page);
-		kunmap(page);
-		put_page(page);
-#endif
 		up_write(&vol->lcnbmp_lock);
 		/* Update the mft bitmap runlist. */
 		rl->length++;
@@ -1497,15 +1134,9 @@ static int ntfs_mft_bitmap_extend_allocation_nolock(struct ntfs_volume *vol)
 		status.added_cluster = 1;
 		ntfs_debug("Appending one cluster to mft bitmap.");
 	} else {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 		folio_unlock(folio);
 		kunmap_local(b);
 		folio_put(folio);
-#else
-		unlock_page(page);
-		kunmap(page);
-		put_page(page);
-#endif
 		up_write(&vol->lcnbmp_lock);
 		/* Allocate a cluster from the DATA_ZONE. */
 		rl2 = ntfs_cluster_alloc(vol, rl[1].vcn, 1, lcn, DATA_ZONE,
@@ -1734,7 +1365,7 @@ static int ntfs_mft_bitmap_extend_initialized_nolock(struct ntfs_volume *vol)
 	struct attr_record *a;
 	int ret;
 
-	ntfs_debug("Extending mft bitmap initiailized (and data) size.");
+	ntfs_debug("Extending mft bitmap initialized (and data) size.");
 	mft_ni = NTFS_I(vol->mft_ino);
 	mftbmp_vi = vol->mftbmp_ino;
 	mftbmp_ni = NTFS_I(mftbmp_vi);
@@ -2232,11 +1863,7 @@ static int ntfs_mft_record_format(const struct ntfs_volume *vol, const s64 mft_n
 {
 	loff_t i_size;
 	struct inode *mft_vi = vol->mft_ino;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	struct folio *folio;
-#else
-	struct page *page;
-#endif
 	struct mft_record *m;
 	pgoff_t index, end_index;
 	unsigned int ofs;
@@ -2262,7 +1889,6 @@ static int ntfs_mft_record_format(const struct ntfs_volume *vol, const s64 mft_n
 	}
 
 	/* Read, map, and pin the folio containing the mft record. */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	folio = read_mapping_folio(mft_vi->i_mapping, index, NULL);
 	if (IS_ERR(folio)) {
 		ntfs_error(vol->sb, "Failed to map page containing mft record to format 0x%llx.",
@@ -2272,37 +1898,17 @@ static int ntfs_mft_record_format(const struct ntfs_volume *vol, const s64 mft_n
 	folio_lock(folio);
 	folio_clear_uptodate(folio);
 	m = (struct mft_record *)((u8 *)kmap_local_folio(folio, 0) + ofs);
-#else
-	page = read_mapping_page(mft_vi->i_mapping, index, NULL);
-	if (IS_ERR(page)) {
-		ntfs_error(vol->sb, "Failed to map page containing mft record to format 0x%llx.",
-				(long long)mft_no);
-		return PTR_ERR(page);
-	}
-	lock_page(page);
-	BUG_ON(!PageUptodate(page));
-	ClearPageUptodate(page);
-	m = (struct mft_record *)((u8 *)page_address(page) + ofs);
-#endif
 	err = ntfs_mft_record_layout(vol, mft_no, m);
 	if (unlikely(err)) {
 		ntfs_error(vol->sb, "Failed to layout mft record 0x%llx.",
 				(long long)mft_no);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 		folio_mark_uptodate(folio);
 		folio_unlock(folio);
 		kunmap_local(m);
 		folio_put(folio);
-#else
-		SetPageUptodate(page);
-		unlock_page(page);
-		kunmap(page);
-		put_page(page);
-#endif
 		return err;
 	}
 	pre_write_mst_fixup((struct ntfs_record *)m, vol->mft_record_size);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	folio_mark_uptodate(folio);
 	/*
 	 * Make sure the mft record is written out to disk.  We could use
@@ -2313,18 +1919,6 @@ static int ntfs_mft_record_format(const struct ntfs_volume *vol, const s64 mft_n
 	folio_unlock(folio);
 	kunmap_local(m);
 	folio_put(folio);
-#else
-	SetPageUptodate(page);
-	/*
-	 * Make sure the mft record is written out to disk.  We could use
-	 * ilookup5() to check if an inode is in icache and so on but this is
-	 * unnecessary as ntfs_writepage() will write the dirty record anyway.
-	 */
-	ntfs_mft_mark_dirty(page);
-	unlock_page(page);
-	kunmap(page);
-	put_page(page);
-#endif
 	ntfs_debug("Done.");
 	return 0;
 }
@@ -2426,11 +2020,7 @@ int ntfs_mft_record_alloc(struct ntfs_volume *vol, const int mode,
 {
 	s64 ll, bit, old_data_initialized, old_data_size;
 	unsigned long flags;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	struct folio *folio;
-#else
-	struct page *page;
-#endif
 	struct ntfs_inode *mft_ni, *mftbmp_ni;
 	struct ntfs_attr_search_ctx *ctx;
 	struct mft_record *m = NULL;
@@ -2714,7 +2304,6 @@ mft_rec_already_initialized:
 	index = NTFS_MFT_NR_TO_PIDX(vol, bit);
 	ofs = NTFS_MFT_NR_TO_POFS(vol, bit);
 	/* Read, map, and pin the folio containing the mft record. */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	folio = read_mapping_folio(vol->mft_ino->i_mapping, index, NULL);
 	if (IS_ERR(folio)) {
 		ntfs_error(vol->sb, "Failed to map page containing allocated mft record 0x%llx.",
@@ -2725,20 +2314,6 @@ mft_rec_already_initialized:
 	folio_lock(folio);
 	folio_clear_uptodate(folio);
 	m = (struct mft_record *)((u8 *)kmap_local_folio(folio, 0) + ofs);
-#else
-	page = read_mapping_page(vol->mft_ino->i_mapping, index, NULL);
-	if (IS_ERR(page)) {
-		ntfs_error(vol->sb, "Failed to map page containing allocated mft record 0x%llx.",
-				bit);
-		err = PTR_ERR(page);
-		goto undo_mftbmp_alloc;
-	}
-	lock_page(page);
-	BUG_ON(!PageUptodate(page));
-	ClearPageUptodate(page);
-	m = (struct mft_record *)((u8 *)page_address(page) + ofs);
-#endif
-
 	/* If we just formatted the mft record no need to do it again. */
 	if (!record_formatted) {
 		/* Sanity check that the mft record is really not in use. */
@@ -2747,17 +2322,10 @@ mft_rec_already_initialized:
 			ntfs_warning(vol->sb,
 				"Mft record 0x%llx was marked free in mft bitmap but is marked used itself. Unmount and run chkdsk.",
 				bit);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 			folio_mark_uptodate(folio);
 			folio_unlock(folio);
 			kunmap_local(m);
 			folio_put(folio);
-#else
-			SetPageUptodate(page);
-			unlock_page(page);
-			kunmap(page);
-			put_page(page);
-#endif
 			NVolSetErrors(vol);
 			goto search_free_rec;
 		}
@@ -2774,17 +2342,10 @@ mft_rec_already_initialized:
 		if (unlikely(err)) {
 			ntfs_error(vol->sb, "Failed to layout allocated mft record 0x%llx.",
 					bit);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 			folio_mark_uptodate(folio);
 			folio_unlock(folio);
 			kunmap_local(m);
 			folio_put(folio);
-#else
-			SetPageUptodate(page);
-			unlock_page(page);
-			kunmap(page);
-			put_page(page);
-#endif
 			goto undo_mftbmp_alloc;
 		}
 		if (seq_no)
@@ -2797,11 +2358,7 @@ mft_rec_already_initialized:
 	m->flags |= MFT_RECORD_IN_USE;
 	if (S_ISDIR(mode))
 		m->flags |= MFT_RECORD_IS_DIRECTORY;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	folio_mark_uptodate(folio);
-#else
-	SetPageUptodate(page);
-#endif
 	if (base_ni) {
 		struct mft_record *m_tmp;
 
@@ -2827,19 +2384,11 @@ mft_rec_already_initialized:
 			/* Set the mft record itself not in use. */
 			m->flags &= cpu_to_le16(
 					~le16_to_cpu(MFT_RECORD_IN_USE));
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 			/* Make sure the mft record is written out to disk. */
 			ntfs_mft_mark_dirty(folio);
 			folio_unlock(folio);
 			kunmap_local(m);
 			folio_put(folio);
-#else
-			/* Make sure the mft record is written out to disk. */
-			ntfs_mft_mark_dirty(page);
-			unlock_page(page);
-			kunmap(page);
-			put_page(page);
-#endif
 			goto undo_mftbmp_alloc;
 		}
 
@@ -2850,24 +2399,14 @@ mft_rec_already_initialized:
 		 * record (e.g. at a minimum a new attribute will be added to
 		 * the mft record.
 		 */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 		ntfs_mft_mark_dirty(folio);
 		folio_unlock(folio);
-#else
-		ntfs_mft_mark_dirty(page);
-		unlock_page(page);
-#endif
 		/*
 		 * Need to unmap the page since map_extent_mft_record() mapped
 		 * it as well so we have it mapped twice at the moment.
 		 */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 		kunmap_local(m);
 		folio_put(folio);
-#else
-		kunmap(page);
-		put_page(page);
-#endif
 	} else {
 		/*
 		 * Manually map, pin, and lock the mft record as we already
@@ -2887,32 +2426,19 @@ mft_rec_already_initialized:
 
 		(*ni)->mrec = kmalloc(vol->mft_record_size, GFP_NOFS);
 		if (!(*ni)->mrec) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 			folio_unlock(folio);
 			kunmap_local(m);
 			folio_put(folio);
-#else
-			unlock_page(page);
-			kunmap(page);
-			put_page(page);
-#endif
 			err = -ENOMEM;
 			goto undo_mftbmp_alloc;
 		}
 
 		memcpy((*ni)->mrec, m, vol->mft_record_size);
 		post_read_mst_fixup((struct ntfs_record *)(*ni)->mrec, vol->mft_record_size);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 		ntfs_mft_mark_dirty(folio);
 		folio_unlock(folio);
 		(*ni)->folio = folio;
 		(*ni)->folio_ofs = ofs;
-#else
-		ntfs_mft_mark_dirty(page);
-		unlock_page(page);
-		(*ni)->page = page;
-		(*ni)->page_ofs = ofs;
-#endif
 		atomic_inc(&(*ni)->count);
 		/* Update the default mft allocation position. */
 		vol->mft_data_pos = bit + 1;
@@ -3069,7 +2595,7 @@ sync_rollback:
 }
 
 static s64 lcn_from_index(struct ntfs_volume *vol, struct ntfs_inode *ni,
-			  unsigned long index)
+		unsigned long index)
 {
 	s64 vcn;
 	s64 lcn;
@@ -3095,19 +2621,9 @@ static s64 lcn_from_index(struct ntfs_volume *vol, struct ntfs_inode *ni,
  *
  * Return: 0 on success, or -errno on error.
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0)
 static int ntfs_write_mft_block(struct folio *folio, struct writeback_control *wbc)
-#else
-static int ntfs_write_mft_block(struct folio *folio, struct writeback_control *wbc,
-		void *data)
-#endif
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0)
 	struct address_space *mapping = folio->mapping;
-#else
-	struct address_space *mapping = data;
-#endif
 	struct inode *vi = mapping->host;
 	struct ntfs_inode *ni = NTFS_I(vi);
 	struct ntfs_volume *vol = ni->vol;
@@ -3172,19 +2688,6 @@ static int ntfs_write_mft_block(struct folio *folio, struct writeback_control *w
 			s64 vcn_off = vcn;
 
 			/*
-			 * Skip $MFT extent mft records and let them being written
-			 * by writeback to avioid deadlocks. the $MFT runlist
-			 * lock must be taken before $MFT extent mrec_lock is taken.
-			 */
-			if (tni && tni->nr_extents < 0 &&
-				tni->ext.base_ntfs_ino == NTFS_I(vol->mft_ino)) {
-				mutex_unlock(&tni->mrec_lock);
-				atomic_dec(&tni->count);
-				iput(vol->mft_ino);
-				continue;
-			}
-
-			/*
 			 * The record should be written.  If a locked ntfs
 			 * inode was returned, add it to the array of locked
 			 * ntfs inodes.
@@ -3224,16 +2727,9 @@ flush_bio:
 
 				off = ((mft_no << vol->mft_record_size_bits) +
 				       mft_record_off) & vol->cluster_size_mask;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
+
 				bio = bio_alloc(vol->sb->s_bdev, 1, REQ_OP_WRITE,
 						GFP_NOIO);
-#else
-				bio = bio_alloc(GFP_NOIO, 1);
-				if (!bio)
-					return -ENOMEM;
-				bio_set_dev(bio, vol->sb->s_bdev);
-				bio->bi_opf = REQ_OP_WRITE;
-#endif
 				bio->bi_iter.bi_sector =
 					ntfs_bytes_to_sector(vol,
 							ntfs_cluster_to_bytes(vol, lcn) + off);
@@ -3316,221 +2812,6 @@ unm_done:
 		ntfs_debug("Done.");
 	return err;
 }
-#else
-static int ntfs_write_mft_block(struct page *page, struct writeback_control *wbc,
-		void *data)
-{
-	struct address_space *mapping = data;
-	struct inode *vi = mapping->host;
-	struct ntfs_inode *ni= NTFS_I(vi);
-	struct ntfs_volume *vol = ni->vol;
-	u8 *kaddr;
-	struct ntfs_inode *locked_nis[PAGE_SIZE / NTFS_BLOCK_SIZE];
-	int nr_locked_nis = 0, err = 0, mft_ofs, prev_mft_ofs;
-	struct inode *ref_inos[PAGE_SIZE / NTFS_BLOCK_SIZE];
-	int nr_ref_inos = 0;
-	struct bio *bio = NULL;
-	unsigned long mft_no;
-	struct ntfs_inode *tni;
-	s64 lcn;
-	s64 vcn = (s64)page->index << PAGE_SHIFT >> vol->cluster_size_bits;
-	s64 end_vcn = ni->allocated_size >> vol->cluster_size_bits;
-	unsigned int page_sz;
-	struct runlist_element *rl;
-	loff_t i_size = i_size_read(vi);
-
-	ntfs_debug("Entering for inode 0x%llx, attribute type 0x%x, page index 0x%lx.",
-			ni->mft_no, ni->type, page->index);
-
-	/* We have to zero every time due to mmap-at-end-of-file. */
-	if (page->index >= (i_size >> PAGE_SHIFT))
-		/* The page straddles i_size. */
-		zero_user_segment(page, i_size & ~PAGE_MASK, PAGE_SIZE);
-
-	BUG_ON(!NInoNonResident(ni));
-	BUG_ON(!NInoMstProtected(ni));
-
-	/*
-	 * NOTE: ntfs_write_mft_block() would be called for $MFTMirr if a page
-	 * in its page cache were to be marked dirty.  However this should
-	 * never happen with the current driver and considering we do not
-	 * handle this case here we do want to BUG(), at least for now.
-	 */
-
-	BUG_ON(!((S_ISREG(vi->i_mode) && !vi->i_ino) || S_ISDIR(vi->i_mode) ||
-		(NInoAttr(ni) && ni->type == AT_INDEX_ALLOCATION)));
-
-	lcn = lcn_from_index(vol, ni, page->index);
-	if (lcn <= LCN_HOLE) {
-		set_page_writeback(page);
-		unlock_page(page);
-		end_page_writeback(page);
-		return -EIO;
-	}
-
-	/* Map the page so we can access its contents. */
-	kaddr = kmap(page);
-	/* Clear the page uptodate flag whilst the mst fixups are applied. */
-	BUG_ON(!PageUptodate(page));
-	ClearPageUptodate(page);
-
-	for (mft_ofs = 0; mft_ofs < PAGE_SIZE && vcn < end_vcn;
-	     mft_ofs += vol->mft_record_size) {
-		/* Get the mft record number. */
-		mft_no = (((s64)page->index << PAGE_SHIFT) + mft_ofs) >>
-			vol->mft_record_size_bits;
-		vcn = mft_no << vol->mft_record_size_bits >> vol->cluster_size_bits;
-		/* Check whether to write this mft record. */
-		tni = NULL;
-		if (ntfs_may_write_mft_record(vol, mft_no,
-					(struct mft_record *)(kaddr + mft_ofs),
-					&tni, &ref_inos[nr_ref_inos])) {
-			unsigned int mft_record_off = 0;
-			s64 vcn_off = vcn;
-
-			/*
-			 * Skip $MFT extent mft records and let them being written
-			 * by writeback to avioid deadlocks. the $MFT runlist
-			 * lock must be taken before $MFT extent mrec_lock is taken.
-			 */
-			if (tni && tni->nr_extents < 0 &&
-				tni->ext.base_ntfs_ino == NTFS_I(vol->mft_ino)) {
-				mutex_unlock(&tni->mrec_lock);
-				atomic_dec(&tni->count);
-				iput(vol->mft_ino);
-				continue;
-			}
-
-			/*
-			 * The record should be written.  If a locked ntfs
-			 * inode was returned, add it to the array of locked
-			 * ntfs inodes.
-			 */
-			if (tni)
-				locked_nis[nr_locked_nis++] = tni;
-			else if (ref_inos[nr_ref_inos])
-				nr_ref_inos++;
-
-			if (bio && (mft_ofs != prev_mft_ofs + vol->mft_record_size)) {
-flush_bio:
-				bio->bi_end_io = ntfs_bio_end_io;
-				submit_bio(bio);
-				bio = NULL;
-			}
-
-			if (vol->cluster_size < PAGE_SIZE) {
-				down_write(&ni->runlist.lock);
-				rl = ntfs_attr_vcn_to_rl(ni, vcn_off, &lcn);
-				up_write(&ni->runlist.lock);
-				if (IS_ERR(rl) || lcn < 0) {
-					err = -EIO;
-					goto unm_done;
-				}
-				if (bio &&
-				   (bio_end_sector(bio) >> (vol->cluster_size_bits - 9)) !=
-				    lcn) {
-					bio->bi_end_io = ntfs_bio_end_io;
-					submit_bio(bio);
-					bio = NULL;
-				}
-			}
-
-			if (!bio) {
-				unsigned int off;
-
-				off = ((mft_no << vol->mft_record_size_bits) +
-				       mft_record_off) & vol->cluster_size_mask;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
-				bio = bio_alloc(vol->sb->s_bdev, 1, REQ_OP_WRITE,
-						GFP_NOIO);
-#else
-				bio = bio_alloc(GFP_NOIO, 1);
-				if (!bio)
-					return NULL;
-				bio_set_dev(bio, vol->sb->s_bdev);
-				bio->bi_opf = REQ_OP_WRITE;
-#endif
-				bio->bi_iter.bi_sector =
-					ntfs_bytes_to_sector(vol,
-							ntfs_cluster_to_bytes(vol, lcn) + off);
-			}
-
-			if (vol->cluster_size == NTFS_BLOCK_SIZE &&
-			    (mft_record_off ||
-			     rl->length - (vcn_off - rl->vcn) == 1 ||
-			     mft_ofs + NTFS_BLOCK_SIZE >= PAGE_SIZE))
-				page_sz = NTFS_BLOCK_SIZE;
-			else
-				page_sz = vol->mft_record_size;
-			if (!bio_add_page(bio, page, page_sz,
-					  mft_ofs + mft_record_off)) {
-				err = -EIO;
-				bio_put(bio);
-				goto unm_done;
-			}
-			mft_record_off += page_sz;
-
-			if (mft_record_off != vol->mft_record_size) {
-				vcn_off++;
-				goto flush_bio;
-			}
-			prev_mft_ofs = mft_ofs;
-
-			if (mft_no < vol->mftmirr_size)
-				ntfs_sync_mft_mirror(vol, mft_no,
-						(struct mft_record *)(kaddr + mft_ofs));
-		} else if (ref_inos[nr_ref_inos])
-			nr_ref_inos++;
-	}
-
-	if (bio) {
-		bio->bi_end_io = ntfs_bio_end_io;
-		submit_bio(bio);
-	}
-unm_done:
-	SetPageUptodate(page);
-	kunmap(page);
-
-	set_page_writeback(page);
-	unlock_page(page);
-	end_page_writeback(page);
-
-	/* Unlock any locked inodes. */
-	while (nr_locked_nis-- > 0) {
-		struct ntfs_inode *base_tni;
-
-		tni = locked_nis[nr_locked_nis];
-		mutex_unlock(&tni->mrec_lock);
-
-		/* Get the base inode. */
-		mutex_lock(&tni->extent_lock);
-		if (tni->nr_extents >= 0)
-			base_tni = tni;
-		else {
-			base_tni = tni->ext.base_ntfs_ino;
-			BUG_ON(!base_tni);
-		}
-		mutex_unlock(&tni->extent_lock);
-		ntfs_debug("Unlocking %s inode 0x%llx.",
-				tni == base_tni ? "base" : "extent",
-				tni->mft_no);
-		atomic_dec(&tni->count);
-		iput(VFS_I(base_tni));
-	}
-
-	/* Dropping deferred references */
-	while (nr_ref_inos-- > 0) {
-		if (ref_inos[nr_ref_inos])
-			iput(ref_inos[nr_ref_inos]);
-	}
-
-	if (unlikely(err && err != -ENOMEM))
-		NVolSetErrors(vol);
-	if (likely(!err))
-		ntfs_debug("Done.");
-	return err;
-}
-#endif
 
 /*
  * ntfs_mft_writepages - Write back dirty folios for the $MFT inode
@@ -3547,35 +2828,18 @@ unm_done:
 int ntfs_mft_writepages(struct address_space *mapping,
 		struct writeback_control *wbc)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0)
 	struct folio *folio = NULL;
 	int error;
-#endif
 
 	if (NVolShutdown(NTFS_I(mapping->host)->vol))
 		return -EIO;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0)
 	while ((folio = writeback_iter(mapping, wbc, folio, &error)))
 		error = ntfs_write_mft_block(folio, wbc);
 	return error;
-#else
-	return write_cache_pages(mapping, wbc,
-				 ntfs_write_mft_block, mapping);
-#endif
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 void ntfs_mft_mark_dirty(struct folio *folio)
 {
 	iomap_dirty_folio(folio->mapping, folio);
-#else
-void ntfs_mft_mark_dirty(struct page *page)
-{
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
-	filemap_dirty_folio(page->mapping, page_folio(page));
-#else
-	__set_page_dirty_nobuffers(page);
-#endif
-#endif
 }

@@ -66,22 +66,12 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
  */
 static inline int write_mft_record(struct ntfs_inode *ni, struct mft_record *m, int sync)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	struct folio *folio = ni->folio;
 	int err;
 
 	folio_lock(folio);
 	err = write_mft_record_nolock(ni, m, sync);
 	folio_unlock(folio);
-#else
-	struct page *page = ni->page;
-	int err;
-
-	BUG_ON(!page);
-	lock_page(page);
-	err = write_mft_record_nolock(ni, m, sync);
-	unlock_page(page);
-#endif
 
 	return err;
 }
@@ -96,9 +86,6 @@ int ntfs_mft_record_check(const struct ntfs_volume *vol, struct mft_record *m,
 			  u64 mft_no);
 int ntfs_mft_writepages(struct address_space *mapping,
 		struct writeback_control *wbc);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 void ntfs_mft_mark_dirty(struct folio *folio);
-#else
-void ntfs_mft_mark_dirty(struct page *page);
-#endif
+
 #endif /* _LINUX_NTFS_MFT_H */

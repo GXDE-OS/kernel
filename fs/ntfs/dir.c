@@ -15,9 +15,7 @@
 #include "index.h"
 #include "reparse.h"
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
 #include <linux/filelock.h>
-#endif
 
 /*
  * The little endian Unicode string $I30 as a global constant.
@@ -82,11 +80,7 @@ u64 ntfs_lookup_inode_by_name(struct ntfs_inode *dir_ni, const __le16 *uname,
 	int err, rc;
 	s64 vcn, old_vcn;
 	struct address_space *ia_mapping;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	struct folio *folio;
-#else
-	struct page *page;
-#endif
 	u8 *kaddr = NULL;
 	struct ntfs_name *name = NULL;
 
@@ -140,10 +134,6 @@ u64 ntfs_lookup_inode_by_name(struct ntfs_inode *dir_ni, const __le16 *uname,
 			break;
 		/* Key length should not be zero if it is not last entry. */
 		if (!ie->key_length)
-			goto dir_err_out;
-		/* Check the consistency of an index entry */
-		if (ntfs_index_entry_inconsistent(NULL, vol, ie, COLLATION_FILE_NAME,
-				dir_ni->mft_no))
 			goto dir_err_out;
 		/*
 		 * We perform a case sensitive comparison and if that matches
@@ -315,7 +305,6 @@ descend_into_child_node:
 	 * of PAGE_SIZE and map the page cache page, reading it from
 	 * disk if necessary.
 	 */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	folio = read_mapping_folio(ia_mapping, vcn <<
 			dir_ni->itype.index.vcn_size_bits >> PAGE_SHIFT, NULL);
 	if (IS_ERR(folio)) {
@@ -338,27 +327,6 @@ descend_into_child_node:
 	post_read_mst_fixup((struct ntfs_record *)kaddr, PAGE_SIZE);
 	folio_unlock(folio);
 	folio_put(folio);
-#else
-	page = read_mapping_page(ia_mapping, vcn <<
-			dir_ni->itype.index.vcn_size_bits >> PAGE_SHIFT, NULL);
-	if (IS_ERR(page)) {
-		ntfs_error(sb, "Failed to map directory index page, error %ld.",
-				-PTR_ERR(page));
-		err = PTR_ERR(page);
-		goto err_out;
-	}
-	lock_page(page);
-	kaddr = kmalloc(PAGE_SIZE, GFP_NOFS);
-	if (!kaddr) {
-		err = -ENOMEM;
-		goto unm_err_out;
-	}
-	memcpy(kaddr, (u8 *)page_address(page), PAGE_SIZE);
-	post_read_mst_fixup((struct ntfs_record *)kaddr, PAGE_SIZE);
-	unlock_page(page);
-	kunmap(page);
-	put_page(page);
-#endif
 fast_descend_into_child_node:
 	/* Get to the index allocation block. */
 	ia = (struct index_block *)(kaddr + ((vcn <<
@@ -370,43 +338,20 @@ fast_descend_into_child_node:
 			dir_ni->mft_no);
 		goto unm_err_out;
 	}
-	/* Catch multi sector transfer fixup errors. */
-	if (unlikely(!ntfs_is_indx_record(ia->magic))) {
-		ntfs_error(sb,
-			"Directory index record with vcn 0x%llx is corrupt.  Corrupt inode 0x%llx.  Run chkdsk.",
-			vcn, dir_ni->mft_no);
-		goto unm_err_out;
-	}
-	if (le64_to_cpu(ia->index_block_vcn) != vcn) {
-		ntfs_error(sb,
-			"Actual VCN (0x%llx) of index buffer is different from expected VCN (0x%llx). Directory inode 0x%llx is corrupt or driver bug.",
-			le64_to_cpu(ia->index_block_vcn),
-			vcn, dir_ni->mft_no);
-		goto unm_err_out;
-	}
-	if (le32_to_cpu(ia->index.allocated_size) + 0x18 !=
-			dir_ni->itype.index.block_size) {
-		ntfs_error(sb,
-			"Index buffer (VCN 0x%llx) of directory inode 0x%llx has a size (%u) differing from the directory specified size (%u). Directory inode is corrupt or driver bug.",
-			vcn, dir_ni->mft_no,
-			le32_to_cpu(ia->index.allocated_size) + 0x18,
-			dir_ni->itype.index.block_size);
-		goto unm_err_out;
-	}
 	index_end = (u8 *)ia + dir_ni->itype.index.block_size;
 	if (index_end > kaddr + PAGE_SIZE) {
 		ntfs_error(sb,
-			"Index buffer (VCN 0x%llx) of directory inode 0x%llx crosses page boundary. Impossible! Cannot access! This is probably a bug in the driver.",
-			vcn, dir_ni->mft_no);
+			   "Index buffer (VCN 0x%llx) of directory inode 0x%llx crosses page boundary. Impossible! Cannot access! This is probably a bug in the driver.",
+			   vcn, dir_ni->mft_no);
 		goto unm_err_out;
 	}
+	err = ntfs_index_block_inconsistent(vol, ia,
+					    dir_ni->itype.index.block_size,
+					    vcn, COLLATION_FILE_NAME,
+					    dir_ni->mft_no);
+	if (err)
+		goto unm_err_out;
 	index_end = (u8 *)&ia->index + le32_to_cpu(ia->index.index_length);
-	if (index_end > (u8 *)ia + dir_ni->itype.index.block_size) {
-		ntfs_error(sb,
-			"Size of index buffer (VCN 0x%llx) of directory inode 0x%llx exceeds maximum size.",
-			vcn, dir_ni->mft_no);
-		goto unm_err_out;
-	}
 	/* The first index entry. */
 	ie = (struct index_entry *)((u8 *)&ia->index +
 			le32_to_cpu(ia->index.entries_offset));
@@ -416,15 +361,6 @@ fast_descend_into_child_node:
 	 * reach the last entry.
 	 */
 	for (;; ie = (struct index_entry *)((u8 *)ie + le16_to_cpu(ie->length))) {
-		/* Bounds checks. */
-		if ((u8 *)ie < (u8 *)ia ||
-		    (u8 *)ie + sizeof(struct index_entry_header) > index_end ||
-		    (u8 *)ie + sizeof(struct index_entry_header) + le16_to_cpu(ie->key_length) >
-				index_end || (u8 *)ie + le16_to_cpu(ie->length) > index_end) {
-			ntfs_error(sb, "Index entry out of bounds in directory inode 0x%llx.",
-					dir_ni->mft_no);
-			goto unm_err_out;
-		}
 		/*
 		 * The last entry cannot contain a name. It can however contain
 		 * a pointer to a child node in the B+tree so we just break out.
@@ -433,10 +369,6 @@ fast_descend_into_child_node:
 			break;
 		/* Key length should not be zero if it is not last entry. */
 		if (!ie->key_length)
-			goto unm_err_out;
-		/* Check the consistency of an index entry */
-		if (ntfs_index_entry_inconsistent(NULL, vol, ie, COLLATION_FILE_NAME,
-				dir_ni->mft_no))
 			goto unm_err_out;
 		/*
 		 * We perform a case sensitive comparison and if that matches
@@ -920,6 +852,7 @@ static int ntfs_readdir(struct file *file, struct dir_context *actor)
 		ictx->vcn_size_bits = vol->cluster_size_bits;
 	else
 		ictx->vcn_size_bits = NTFS_BLOCK_SIZE_BITS;
+	ictx->cr = ir->collation_rule;
 
 	/* The first index entry. */
 	next = (struct index_entry *)((u8 *)&ir->index +
@@ -957,13 +890,6 @@ static int ntfs_readdir(struct file *file, struct dir_context *actor)
 		if (!next)
 			break;
 nextdir:
-		/* Check the consistency of an index entry */
-		if (ntfs_index_entry_inconsistent(ictx, vol, next, COLLATION_FILE_NAME,
-					ndir->mft_no)) {
-			err = -EIO;
-			goto out;
-		}
-
 		if (ie_pos < actor->pos) {
 			ie_pos += le16_to_cpu(next->length);
 			continue;
@@ -1265,13 +1191,9 @@ const struct file_operations ntfs_dir_ops = {
 	.fsync		= ntfs_dir_fsync,	/* Sync a directory to disk. */
 	.open		= ntfs_dir_open,	/* Open directory. */
 	.release	= ntfs_dir_release,
-#if LINUX_VERSION_CODE > KERNEL_VERSION(5, 16, 0)
 	.unlocked_ioctl	= ntfs_ioctl,
 #ifdef CONFIG_COMPAT
 	.compat_ioctl	= ntfs_compat_ioctl,
 #endif
-#endif
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
 	.setlease	= generic_setlease,
-#endif
 };

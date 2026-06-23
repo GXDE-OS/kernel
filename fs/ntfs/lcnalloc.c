@@ -194,11 +194,7 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol, const s64 st
 	struct inode *lcnbmp_vi;
 	struct runlist_element *rl = NULL;
 	struct address_space *mapping;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	struct folio *folio = NULL;
-#else
-	struct page *page = NULL;
-#endif
 	u8 *buf = NULL, *byte;
 	int err = 0, rlpos, rlsize, buf_size, pg_off;
 	u8 pass, done_zones, search_zone, need_writeback = 0, bit;
@@ -315,7 +311,6 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol, const s64 st
 			ntfs_debug("End of attribute reached. Skipping to zone_pass_done.");
 			goto zone_pass_done;
 		}
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 		if (likely(folio)) {
 			if (need_writeback) {
 				ntfs_debug("Marking page dirty.");
@@ -327,19 +322,6 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol, const s64 st
 			folio_put(folio);
 			folio = NULL;
 		}
-#else
-		if (likely(page)) {
-			if (need_writeback) {
-				ntfs_debug("Marking page dirty.");
-				set_page_dirty(page);
-				need_writeback = 0;
-			}
-			unlock_page(page);
-			kunmap(page);
-			put_page(page);
-			page = NULL;
-		}
-#endif
 
 		index = last_read_pos >> PAGE_SHIFT;
 		pg_off = last_read_pos & ~PAGE_MASK;
@@ -353,7 +335,6 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol, const s64 st
 		if (vol->lcn_empty_bits_per_page[index] == 0)
 			goto next_bmp_pos;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 		folio = read_mapping_folio(mapping, index, NULL);
 		if (IS_ERR(folio)) {
 			err = PTR_ERR(folio);
@@ -363,17 +344,6 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol, const s64 st
 
 		folio_lock(folio);
 		buf = kmap_local_folio(folio, 0) + pg_off;
-#else
-		page = read_mapping_page(mapping, index, NULL);
-		if (IS_ERR(page)) {
-			err = PTR_ERR(page);
-			ntfs_error(vol->sb, "Failed to map page.");
-			goto out;
-		}
-
-		lock_page(page);
-		buf = page_address(page) + pg_off;
-#endif
 		ntfs_debug("Before inner while loop: buf_size %i, lcn 0x%llx, bmp_pos 0x%llx, need_writeback %i.",
 				buf_size, lcn, bmp_pos, need_writeback);
 		while (lcn < buf_size && lcn + bmp_pos < zone_end) {
@@ -751,7 +721,6 @@ out:
 		rl[rlpos].lcn = is_extension ? LCN_ENOENT : LCN_RL_NOT_MAPPED;
 		rl[rlpos].length = 0;
 	}
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	if (!IS_ERR_OR_NULL(folio)) {
 		if (need_writeback) {
 			ntfs_debug("Marking page dirty.");
@@ -762,18 +731,6 @@ out:
 		kunmap_local(buf);
 		folio_put(folio);
 	}
-#else
-	if (!IS_ERR_OR_NULL(page)) {
-		if (need_writeback) {
-			ntfs_debug("Marking page dirty.");
-			set_page_dirty(page);
-			need_writeback = 0;
-		}
-		unlock_page(page);
-		kunmap(page);
-		put_page(page);
-	}
-#endif
 	if (likely(!err)) {
 		if (!rl) {
 			err = -EIO;

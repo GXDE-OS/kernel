@@ -108,17 +108,10 @@ static void zero_partial_compressed_page(struct page *page,
 	unsigned int kp_ofs;
 
 	ntfs_debug("Zeroing page region outside initialized size.");
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
 	if (((s64)page->__folio_index << PAGE_SHIFT) >= initialized_size) {
 		clear_page(kp);
 		return;
 	}
-#else
-	if (((s64)page->index << PAGE_SHIFT) >= initialized_size) {
-		clear_page(kp);
-		return;
-	}
-#endif
 	kp_ofs = initialized_size & ~PAGE_MASK;
 	memset(kp + kp_ofs, 0, PAGE_SIZE - kp_ofs);
 }
@@ -132,15 +125,9 @@ static void zero_partial_compressed_page(struct page *page,
 static inline void handle_bounds_compressed_page(struct page *page,
 		const loff_t i_size, const s64 initialized_size)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
 	if ((page->__folio_index >= (initialized_size >> PAGE_SHIFT)) &&
 			(initialized_size < i_size))
 		zero_partial_compressed_page(page, initialized_size);
-#else
-	if ((page->index >= (initialized_size >> PAGE_SHIFT)) &&
-			(initialized_size < i_size))
-		zero_partial_compressed_page(page, initialized_size);
-#endif
 }
 
 /*
@@ -473,14 +460,9 @@ return_overflow:
  * have been written to so that we would lose data if we were to just overwrite
  * them with the out-of-date uncompressed data.
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 int ntfs_read_compressed_block(struct folio *folio)
 {
 	struct page *page = &folio->page;
-#else
-int ntfs_read_compressed_block(struct page *page)
-{
-#endif
 	loff_t i_size;
 	s64 initialized_size;
 	struct address_space *mapping = page->mapping;
@@ -490,11 +472,7 @@ int ntfs_read_compressed_block(struct page *page)
 	struct runlist_element *rl;
 	unsigned long flags;
 	u8 *cb, *cb_pos, *cb_end;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
 	unsigned long offset, index = page->__folio_index;
-#else
-	unsigned long offset, index = page->index;
-#endif
 	u32 cb_size = ni->itype.compressed.block_size;
 	u64 cb_size_mask = cb_size - 1UL;
 	s64 vcn;
@@ -568,11 +546,7 @@ int ntfs_read_compressed_block(struct page *page)
 	if (xpage >= max_page) {
 		kfree(pages);
 		kfree(completed_pages);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
 		zero_user_segments(page, 0, PAGE_SIZE, 0, 0);
-#else
-		zero_user(page, 0, PAGE_SIZE);
-#endif
 		ntfs_debug("Compressed read outside i_size - truncated?");
 		SetPageUptodate(page);
 		unlock_page(page);
@@ -669,13 +643,8 @@ lock_retry_remap:
 		page_ofs = ntfs_cluster_to_poff(vol, lcn);
 		page_index = ntfs_cluster_to_pidx(vol, lcn);
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
 		lpage = read_mapping_page(sb->s_bdev->bd_mapping,
 					  page_index, NULL);
-#else
-		lpage = read_mapping_page(sb->s_bdev->bd_inode->i_mapping,
-					  page_index, NULL);
-#endif
 		if (IS_ERR(lpage)) {
 			err = PTR_ERR(lpage);
 			mutex_unlock(&ntfs_cb_lock);
@@ -855,11 +824,7 @@ lock_retry_remap:
 		if (page) {
 			ntfs_error(vol->sb,
 				"Still have pages left! Terminating them with extreme prejudice.  Inode 0x%llx, page index 0x%lx.",
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
 				ni->mft_no, page->__folio_index);
-#else
-				ni->mft_no, page->index);
-#endif
 			flush_dcache_page(page);
 			kunmap_local(page_address(page));
 			unlock_page(page);
@@ -1461,16 +1426,8 @@ static int ntfs_write_cb(struct ntfs_inode *ni, loff_t pos, struct page **pages,
 
 setup_bio:
 		if (!bio) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
 			bio = bio_alloc(vol->sb->s_bdev, 1, REQ_OP_WRITE,
 					GFP_NOIO);
-#else
-			bio = bio_alloc(GFP_NOIO, 1);
-			if (!bio)
-				return NULL;
-			bio_set_dev(bio, vol->sb->s_bdev);
-			bio->bi_opf = REQ_OP_WRITE;
-#endif
 			bio->bi_iter.bi_sector =
 				ntfs_bytes_to_sector(vol,
 						ntfs_cluster_to_bytes(vol, bio_lcn + i));
@@ -1574,13 +1531,8 @@ int ntfs_compress_write(struct ntfs_inode *ni, loff_t pos, size_t count,
 			size_t cp, tail = PAGE_SIZE - off;
 
 			page = pages[ip];
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 			cp = copy_folio_from_iter_atomic(page_folio(page), off,
 					min(tail, bytes), from);
-#else
-			cp = copy_page_from_iter_atomic(page, off,
-					min(tail, bytes), from);
-#endif
 			flush_dcache_page(page);
 
 			copied += cp;

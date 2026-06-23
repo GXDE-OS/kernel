@@ -98,11 +98,7 @@ static int ntfs_init_locked_inode(struct inode *vi, void *data)
 
 	ni->name = na->name;
 	ni->name_len = na->name_len;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	ni->folio = NULL;
-#else
-	ni->page = NULL;
-#endif
 	atomic_set(&ni->count, 1);
 
 	/* If initializing a normal inode, we are done. */
@@ -320,11 +316,7 @@ struct inode *ntfs_alloc_big_inode(struct super_block *sb)
 	struct ntfs_inode *ni;
 
 	ntfs_debug("Entering.");
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
 	ni = alloc_inode_sb(sb, ntfs_big_inode_cache, GFP_NOFS);
-#else
-	ni = kmem_cache_alloc(ntfs_big_inode_cache, GFP_NOFS);
-#endif
 	if (likely(ni != NULL)) {
 		ni->state = 0;
 		ni->type = 0;
@@ -428,11 +420,7 @@ int ntfs_drop_big_inode(struct inode *inode)
 		return 0;
 	}
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
 	return inode_generic_drop(inode);
-#else
-	return generic_drop_inode(inode);
-#endif
 }
 
 static inline struct ntfs_inode *ntfs_alloc_extent_inode(void)
@@ -455,15 +443,8 @@ static void ntfs_destroy_extent_inode(struct ntfs_inode *ni)
 
 	if (!atomic_dec_and_test(&ni->count))
 		WARN_ON(1);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	if (ni->folio)
 		folio_put(ni->folio);
-#else
-	if (ni->page) {
-		kunmap(ni->page);
-		put_page(ni->page);
-	}
-#endif
 	kfree(ni->mrec);
 	kmem_cache_free(ntfs_inode_cache, ni);
 }
@@ -507,13 +488,8 @@ void __ntfs_init_inode(struct super_block *sb, struct ntfs_inode *ni)
 				  &attr_inode_mrec_lock_class);
 	}
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	ni->folio = NULL;
 	ni->folio_ofs = 0;
-#else
-	ni->page = NULL;
-	ni->page_ofs = 0;
-#endif
 	ni->mrec = NULL;
 	ni->attr_list_size = 0;
 	ni->attr_list = NULL;
@@ -528,6 +504,8 @@ void __ntfs_init_inode(struct super_block *sb, struct ntfs_inode *ni)
 	ni->flags = 0;
 	ni->mft_lcn[0] = LCN_RL_NOT_MAPPED;
 	ni->mft_lcn_count = 0;
+	ni->reparse_tag = 0;
+	ni->reparse_flags = 0;
 	ni->target = NULL;
 	ni->i_dealloc_clusters = 0;
 }
@@ -812,30 +790,18 @@ static int ntfs_read_locked_inode(struct inode *vi)
 	 */
 	ni->i_crtime = ntfs2utc(si->creation_time);
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
 	inode_set_mtime_to_ts(vi, ntfs2utc(si->last_data_change_time));
-#else
-	vi->i_mtime = ntfs2utc(si->last_data_change_time);
-#endif
 	/*
 	 * ctime is the last change of the metadata of the file. This obviously
 	 * always changes, when mtime is changed. ctime can be changed on its
 	 * own, mtime is then not changed, e.g. when a file is renamed.
 	 */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	inode_set_ctime_to_ts(vi, ntfs2utc(si->last_mft_change_time));
-#else
-	vi->i_ctime = ntfs2utc(si->last_mft_change_time);
-#endif
 	/*
 	 * Last access to the data within the file. Not changed during a rename
 	 * for example but changed whenever the file is written to.
 	 */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
 	inode_set_atime_to_ts(vi, ntfs2utc(si->last_access_time));
-#else
-	vi->i_atime = ntfs2utc(si->last_access_time);
-#endif
 	ni->flags = si->file_attributes;
 
 	/* Find the attribute list attribute if present. */
@@ -900,6 +866,12 @@ static int ntfs_read_locked_inode(struct inode *vi)
 					a->data.resident.value_offset),
 					le32_to_cpu(
 					a->data.resident.value_length));
+			/* A resident list is not validated on load; check it now. */
+			if (!ntfs_attr_list_is_valid(ni->attr_list,
+						     ni->attr_list_size)) {
+				ntfs_error(vi->i_sb, "Corrupt attribute list.");
+				goto unm_err_out;
+			}
 		}
 	}
 skip_attr_list_load:
@@ -909,8 +881,26 @@ skip_attr_list_load:
 		ntfs_ea_get_wsl_inode(vi, &dev, flags);
 	}
 
-	if (m->flags & MFT_RECORD_IS_DIRECTORY) {
+	if (ni->flags & FILE_ATTR_REPARSE_POINT) {
+		unsigned int mode;
+
+		mode = ntfs_make_symlink(ni);
+		if (mode)
+			vi->i_mode |= mode;
+		else {
+			vi->i_mode &= ~S_IFLNK;
+			if (m->flags & MFT_RECORD_IS_DIRECTORY)
+				vi->i_mode |= S_IFDIR;
+			else
+				vi->i_mode |= S_IFREG;
+		}
+	} else if (m->flags & MFT_RECORD_IS_DIRECTORY) {
 		vi->i_mode |= S_IFDIR;
+	} else {
+		vi->i_mode |= S_IFREG;
+	}
+
+	if (S_ISDIR(vi->i_mode)) {
 		/*
 		 * Apply the directory permissions mask set in the mount
 		 * options.
@@ -920,18 +910,6 @@ skip_attr_list_load:
 		if (vi->i_nlink > 1)
 			set_nlink(vi, 1);
 	} else {
-		if (ni->flags & FILE_ATTR_REPARSE_POINT) {
-			unsigned int mode;
-
-			mode = ntfs_make_symlink(ni);
-			if (mode)
-				vi->i_mode |= mode;
-			else {
-				vi->i_mode &= ~S_IFLNK;
-				vi->i_mode |= S_IFREG;
-			}
-		} else
-			vi->i_mode |= S_IFREG;
 		/* Apply the file permissions mask set in the mount options. */
 		vi->i_mode &= ~vol->fmask;
 	}
@@ -940,9 +918,8 @@ skip_attr_list_load:
 	 * If an attribute list is present we now have the attribute list value
 	 * in ntfs_ino->attr_list and it is ntfs_ino->attr_list_size bytes.
 	 */
-	if (S_ISDIR(vi->i_mode)) {
+	if (m->flags & MFT_RECORD_IS_DIRECTORY) {
 		struct index_root *ir;
-		u8 *ir_end, *index_end;
 
 view_index_meta:
 		/* It is a directory, find index root attribute. */
@@ -992,10 +969,9 @@ view_index_meta:
 		}
 		ir = (struct index_root *)((u8 *)a +
 				le16_to_cpu(a->data.resident.value_offset));
-		ir_end = (u8 *)ir + le32_to_cpu(a->data.resident.value_length);
-		index_end = (u8 *)&ir->index +
-				le32_to_cpu(ir->index.index_length);
-		if (index_end > ir_end) {
+		if (ntfs_index_root_inconsistent(ni->vol, a, ir, ni->mft_no) ||
+		    ntfs_index_entries_inconsistent(ni->vol, &ir->index,
+						    ir->collation_rule, ni->mft_no)) {
 			ntfs_error(vi->i_sb, "Directory index is corrupt.");
 			goto unm_err_out;
 		}
@@ -1066,7 +1042,7 @@ view_index_meta:
 		m = NULL;
 		ctx = NULL;
 		/* Setup the operations for this inode. */
-		ntfs_set_vfs_operations(vi, S_IFDIR, 0);
+		ntfs_set_vfs_operations(vi, vi->i_mode, 0);
 		if (ir->index.flags & LARGE_INDEX)
 			NInoSetIndexAllocPresent(ni);
 	} else {
@@ -1247,6 +1223,9 @@ no_data_attr_special_case:
 	else
 		vi->i_blocks = ni->allocated_size >> 9;
 
+	if (S_ISLNK(vi->i_mode) && ni->target)
+		vi->i_size = strlen(ni->target);
+
 	ntfs_debug("Done.");
 	return 0;
 unm_err_out:
@@ -1304,21 +1283,9 @@ static int ntfs_read_locked_attr_inode(struct inode *base_vi, struct inode *vi)
 	vi->i_uid	= base_vi->i_uid;
 	vi->i_gid	= base_vi->i_gid;
 	set_nlink(vi, base_vi->i_nlink);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
 	inode_set_mtime_to_ts(vi, inode_get_mtime(base_vi));
-#else
-	vi->i_mtime	= base_vi->i_mtime;
-#endif
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	inode_set_ctime_to_ts(vi, inode_get_ctime(base_vi));
-#else
-	vi->i_ctime	= base_vi->i_ctime;
-#endif
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
 	inode_set_atime_to_ts(vi, inode_get_atime(base_vi));
-#else
-	vi->i_atime	= base_vi->i_atime;
-#endif
 	vi->i_generation = ni->seq_no = base_ni->seq_no;
 
 	/* Set inode type to zero but preserve permissions. */
@@ -1547,7 +1514,6 @@ static int ntfs_read_locked_index_inode(struct inode *base_vi, struct inode *vi)
 	struct attr_record *a;
 	struct ntfs_attr_search_ctx *ctx;
 	struct index_root *ir;
-	u8 *ir_end, *index_end;
 	int err = 0;
 
 	ntfs_debug("Entering for i_ino 0x%llx.", ni->mft_no);
@@ -1558,21 +1524,9 @@ static int ntfs_read_locked_index_inode(struct inode *base_vi, struct inode *vi)
 	vi->i_uid	= base_vi->i_uid;
 	vi->i_gid	= base_vi->i_gid;
 	set_nlink(vi, base_vi->i_nlink);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
 	inode_set_mtime_to_ts(vi, inode_get_mtime(base_vi));
-#else
-	vi->i_mtime	= base_vi->i_mtime;
-#endif
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	inode_set_ctime_to_ts(vi, inode_get_ctime(base_vi));
-#else
-	vi->i_ctime	= base_vi->i_ctime;
-#endif
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
 	inode_set_atime_to_ts(vi, inode_get_atime(base_vi));
-#else
-	vi->i_atime	= base_vi->i_atime;
-#endif
 	vi->i_generation = ni->seq_no = base_ni->seq_no;
 	/* Set inode type to zero but preserve permissions. */
 	vi->i_mode	= base_vi->i_mode & ~S_IFMT;
@@ -1610,9 +1564,9 @@ static int ntfs_read_locked_index_inode(struct inode *base_vi, struct inode *vi)
 	}
 
 	ir = (struct index_root *)((u8 *)a + le16_to_cpu(a->data.resident.value_offset));
-	ir_end = (u8 *)ir + le32_to_cpu(a->data.resident.value_length);
-	index_end = (u8 *)&ir->index + le32_to_cpu(ir->index.index_length);
-	if (index_end > ir_end) {
+	if (ntfs_index_root_inconsistent(vol, a, ir, ni->mft_no) ||
+	    ntfs_index_entries_inconsistent(vol, &ir->index,
+					    ir->collation_rule, ni->mft_no)) {
 		ntfs_error(vi->i_sb, "Index is corrupt.");
 		goto unm_err_out;
 	}
@@ -1825,12 +1779,8 @@ static int load_attribute_list_mount(struct ntfs_volume *vol,
 		if (al + rl_byte_len > al_end)
 			rl_byte_len = al_end - al;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
 		err = ntfs_bdev_read(sb->s_bdev, al, rl_byte_off,
 				   round_up(rl_byte_len, SECTOR_SIZE));
-#else
-		err = ntfs_dev_read(sb, al, rl_byte_off, rl_byte_len);
-#endif
 		if (err) {
 			ntfs_error(sb, "Cannot read attribute list.");
 			return -EIO;
@@ -1947,12 +1897,8 @@ int ntfs_read_inode_mount(struct inode *vi)
 		nr_blocks = 1;
 
 	/* Load $MFT/$DATA's first mft record. */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
 	err = ntfs_bdev_read(sb->s_bdev, (char *)m,
 			     ntfs_cluster_to_bytes(vol, vol->mft_lcn), i);
-#else
-	err = ntfs_dev_read(sb, m, ntfs_cluster_to_bytes(vol, vol->mft_lcn), i);
-#endif
 	if (err) {
 		ntfs_error(sb, "Device read failed.");
 		goto err_out;
@@ -2078,10 +2024,7 @@ int ntfs_read_inode_mount(struct inode *vi)
 			/* Catch the end of the attribute list. */
 			if ((u8 *)al_entry == al_end)
 				goto em_put_err_out;
-			if (!al_entry->length)
-				goto em_put_err_out;
-			if ((u8 *)al_entry + 6 > al_end ||
-			    (u8 *)al_entry + le16_to_cpu(al_entry->length) > al_end)
+			if (!ntfs_attr_list_entry_is_valid(al_entry, al_end))
 				goto em_put_err_out;
 			next_al_entry = (struct attr_list_entry *)((u8 *)al_entry +
 					le16_to_cpu(al_entry->length));
@@ -2396,15 +2339,8 @@ release:
 
 	if (!atomic_dec_and_test(&ni->count))
 		WARN_ON(1);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	if (ni->folio)
 		folio_put(ni->folio);
-#else
-	if (ni->page) {
-		kunmap(ni->page);
-		put_page(ni->page);
-	}
-#endif
 	kfree(ni->mrec);
 	kvfree(ni->target);
 }
@@ -2458,6 +2394,14 @@ int ntfs_show_options(struct seq_file *sf, struct dentry *root)
 		seq_puts(sf, ",discard");
 	if (NVolDisableSparse(vol))
 		seq_puts(sf, ",disable_sparse");
+	if (NVolNativeSymlinkRel(vol))
+		seq_puts(sf, ",native_symlink=rel");
+	else
+		seq_puts(sf, ",native_symlink=raw");
+	if (NVolSymlinkNative(vol))
+		seq_puts(sf, ",symlink=native");
+	else
+		seq_puts(sf, ",symlink=wsl");
 	if (vol->sb->s_flags & SB_POSIXACL)
 		seq_puts(sf, ",acl");
 	return 0;
@@ -2485,22 +2429,10 @@ int ntfs_extend_initialized_size(struct inode *vi, const loff_t offset,
 		return err;
 
 	if (!NInoCompressed(ni) && old_init_size < offset) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
 		err = iomap_zero_range(vi, old_init_size,
 				       offset - old_init_size,
 				       NULL, &ntfs_seek_iomap_ops,
 				       &ntfs_iomap_folio_ops, NULL);
-#else
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
-                err = iomap_zero_range(vi, old_init_size,
-				       offset - old_init_size,
-				       NULL, &ntfs_seek_iomap_ops, NULL);
-#else
-		err = iomap_zero_range(vi, old_init_size,
-				       offset - old_init_size,
-				       NULL, &ntfs_seek_iomap_ops);
-#endif
-#endif
 		if (err)
 			return err;
 		if (bsync)
@@ -2529,15 +2461,7 @@ int ntfs_truncate_vfs(struct inode *vi, loff_t new_size, loff_t i_size)
 	if (err < 0)
 		return err;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
 	inode_set_mtime_to_ts(vi, inode_set_ctime_current(vi));
-#else
-	vi->i_mtime = inode_set_ctime_current(vi);
-#endif
-#else
-	vi->i_ctime = vi->i_mtime = current_time(vi);
-#endif
 	return 0;
 }
 
@@ -2585,11 +2509,7 @@ static int ntfs_inode_sync_standard_information(struct inode *vi, struct mft_rec
 	}
 
 	/* Update the access times if they have changed. */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	nt = utc2ntfs(inode_get_mtime(vi));
-#else
-	nt = utc2ntfs(vi->i_mtime);
-#endif
 	if (si->last_data_change_time != nt) {
 		ntfs_debug("Updating mtime for inode 0x%llx: old = 0x%llx, new = 0x%llx",
 				ni->mft_no, le64_to_cpu(si->last_data_change_time),
@@ -2598,11 +2518,7 @@ static int ntfs_inode_sync_standard_information(struct inode *vi, struct mft_rec
 		modified = true;
 	}
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	nt = utc2ntfs(inode_get_ctime(vi));
-#else
-	nt = utc2ntfs(vi->i_ctime);
-#endif
 	if (si->last_mft_change_time != nt) {
 		ntfs_debug("Updating ctime for inode 0x%llx: old = 0x%llx, new = 0x%llx",
 				ni->mft_no, le64_to_cpu(si->last_mft_change_time),
@@ -2610,11 +2526,7 @@ static int ntfs_inode_sync_standard_information(struct inode *vi, struct mft_rec
 		si->last_mft_change_time = nt;
 		modified = true;
 	}
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
 	nt = utc2ntfs(inode_get_atime(vi));
-#else
-	nt = utc2ntfs(vi->i_atime);
-#endif
 	if (si->last_access_time != nt) {
 		ntfs_debug("Updating atime for inode 0x%llx: old = 0x%llx, new = 0x%llx",
 				ni->mft_no,
@@ -3177,11 +3089,7 @@ int ntfs_inode_add_attrlist(struct ntfs_inode *ni)
 				ctx->attr->name_length + 7) & ~7;
 		al_len += ale_size;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 		aln = kvrealloc(al, al_len, GFP_NOFS);
-#else
-		aln = kvrealloc(al, al_len - ale_size, al_len, GFP_NOFS);
-#endif
 		if (!aln) {
 			err = -ENOMEM;
 			ntfs_error(ni->vol->sb, "Failed to realloc %d bytes", al_len);
@@ -3362,25 +3270,12 @@ int ntfs_inode_close(struct ntfs_inode *ni)
 		 * thus we explicitly separate these two cases.
 		 */
 		if (base_ni->nr_extents) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 			/* Resize the memory buffer. */
 			tmp_nis = kvrealloc(tmp_nis, base_ni->nr_extents *
 					sizeof(struct ntfs_inode *), GFP_NOFS);
 			/* Ignore errors, they don't really matter. */
 			if (tmp_nis)
 				base_ni->ext.extent_ntfs_inos = tmp_nis;
-#else
-			struct ntfs_inode **new_nis;
-			size_t new_size = base_ni->nr_extents * sizeof(struct ntfs_inode *);
-
-			/* Resize the memory buffer. */
-			new_nis = kmalloc(new_size, GFP_NOFS);
-			if (new_nis) {
-				memcpy(new_nis, tmp_nis, new_size);
-				base_ni->ext.extent_ntfs_inos = new_nis;
-				kvfree(tmp_nis);
-			}
-#endif
 		} else if (tmp_nis) {
 			kvfree(tmp_nis);
 			base_ni->ext.extent_ntfs_inos = NULL;
@@ -3578,19 +3473,12 @@ put_err_out:
 s64 ntfs_inode_attr_pread(struct inode *vi, s64 pos, s64 count, u8 *buf)
 {
 	struct address_space *mapping = vi->i_mapping;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	struct folio *folio;
-#else
-	struct page *page;
-#endif
 	struct ntfs_inode *ni = NTFS_I(vi);
 	s64 isize;
 	u32 attr_len, total = 0, offset;
 	pgoff_t index;
 	int err = 0;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
-	u8 *addr;
-#endif
 
 	WARN_ON(!NInoAttr(ni));
 	if (!count)
@@ -3635,7 +3523,6 @@ s64 ntfs_inode_attr_pread(struct inode *vi, s64 pos, s64 count, u8 *buf)
 	mutex_unlock(&ni->mrec_lock);
 
 	index = pos >> PAGE_SHIFT;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	do {
 		/* Update @index and get the next folio. */
 		folio = read_mapping_folio(mapping, index, NULL);
@@ -3656,30 +3543,6 @@ s64 ntfs_inode_attr_pread(struct inode *vi, s64 pos, s64 count, u8 *buf)
 		count -= attr_len;
 		index++;
 	} while (count);
-#else
-	do {
-		/* Update @index and get the next page. */
-		page = read_mapping_page(mapping, index, NULL);
-		if (IS_ERR(page))
-			break;
-		addr = page_address(page);
-		offset = pos % PAGE_SIZE;
-		attr_len = PAGE_SIZE - offset;
-		if (attr_len > count)
-			attr_len = count;
-		lock_page(page);
-		memcpy(buf, addr + offset, attr_len);
-		total += attr_len;
-		buf += attr_len;
-		pos += attr_len;
-		count -= attr_len;
-		unlock_page(page);
-		kunmap(page);
-		put_page(page);
-		index++;
-	} while (count);
-#endif
-
 out:
 	return err ? (s64)err : total;
 }
@@ -3737,12 +3600,7 @@ static s64 __ntfs_inode_resident_attr_pwrite(struct inode *vi,
 					     struct ntfs_attr_search_ctx *ctx)
 {
 	struct ntfs_inode *ni = NTFS_I(vi);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	struct folio *folio;
-#else
-	struct page *page;
-	u8 *paddr;
-#endif
 	struct address_space *mapping = vi->i_mapping;
 	u8 *addr;
 	int err = 0;
@@ -3759,7 +3617,6 @@ static s64 __ntfs_inode_resident_attr_pwrite(struct inode *vi,
 	mark_mft_record_dirty(ctx->ntfs_ino);
 
 	/* Keep the first page clean and uptodate */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	folio = __filemap_get_folio(mapping, 0, FGP_WRITEBEGIN | FGP_NOFS,
 				   mapping_gfp_mask(mapping));
 	if (IS_ERR(folio)) {
@@ -3768,55 +3625,18 @@ static s64 __ntfs_inode_resident_attr_pwrite(struct inode *vi,
 			   ni->type, err);
 		goto out;
 	}
-	if (!folio_test_uptodate(folio)) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+	if (!folio_test_uptodate(folio))
 		folio_fill_tail(folio, 0, addr,
 				le32_to_cpu(ctx->attr->data.resident.value_length));
-#else
-		u32 len = le32_to_cpu(ctx->attr->data.resident.value_length);
-		memcpy_to_folio(folio, 0, addr, len);
-		folio_zero_segment(folio, offset_in_folio(folio, len),
-				   folio_size(folio) - len);
-#endif
-	} else {
+	else
 		memcpy_to_folio(folio, offset_in_folio(folio, pos), buf, count);
-	}
 	folio_mark_uptodate(folio);
 	folio_unlock(folio);
 	folio_put(folio);
-#else
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0)
-	page = grab_cache_page_write_begin(mapping, 0);
-#else
-	page = grab_cache_page_write_begin(mapping, 0, AOP_FLAG_NOFS);
-#endif
-	if (!page) {
-		err = -ENOMEM;
-		ntfs_error(vi->i_sb, "Failed to read a page 0 for attr %#x: %d",
-			   ni->type, err);
-		goto out;
-	}
-
-	paddr = kmap(page);
-	if (!PageUptodate(page)) {
-		u32 len = le32_to_cpu(ctx->attr->data.resident.value_length);
-
-		memcpy(paddr, addr, len);
-		memset(paddr + len, 0, PAGE_SIZE - len);
-	} else
-		memcpy(paddr + pos, buf, count);
-	flush_dcache_page(page);
-	kunmap(page);
-	SetPageUptodate(page);
-	unlock_page(page);
-	put_page(page);
-#endif
-
 out:
 	return err ? err : count;
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 static s64 __ntfs_inode_non_resident_attr_pwrite(struct inode *vi,
 						 s64 pos, s64 count, u8 *buf,
 						 struct ntfs_attr_search_ctx *ctx,
@@ -3897,16 +3717,9 @@ static s64 __ntfs_inode_non_resident_attr_pwrite(struct inode *vi,
 					lcn_folio_off = folio->index << PAGE_SHIFT;
 					lcn_folio_off &= vol->cluster_size_mask;
 				}
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
+
 				bio = bio_alloc(vol->sb->s_bdev, 1, REQ_OP_WRITE,
 						GFP_NOIO);
-#else
-				bio = bio_alloc(GFP_NOIO, 1);
-				if (!bio)
-					return NULL;
-				bio_set_dev(bio, vol->sb->s_bdev);
-				bio->bi_opf = REQ_OP_WRITE;
-#endif
 				bio->bi_iter.bi_sector =
 					ntfs_bytes_to_sector(vol,
 							ntfs_cluster_to_bytes(vol, lcn) +
@@ -3950,58 +3763,6 @@ err_unlock_folio:
 
 	return ret ? ret : written;
 }
-#else
-static s64 __ntfs_inode_non_resident_attr_pwrite(struct inode *vi,
-						 s64 pos, s64 count, u8 *buf,
-						 struct ntfs_attr_search_ctx *ctx,
-						 bool sync)
-{
-	struct ntfs_inode *ni = NTFS_I(vi);
-	struct address_space *mapping = vi->i_mapping;
-	struct page *page;
-	pgoff_t index;
-	u8 *addr;
-	u32 attr_len;
-	loff_t offset;
-	s64 ret = 0, written = 0;
-
-	BUG_ON(!NInoNonResident(ni));
-
-	index = pos >> PAGE_SHIFT;
-	while (count) {
-		page = read_mapping_page(mapping, index, NULL);
-		if (IS_ERR(page)) {
-			ret = PTR_ERR(page);
-			ntfs_error(vi->i_sb, "Failed to read a page %lu for attr %#x: %ld",
-				   index, ni->type, PTR_ERR(page));
-			break;
-		}
-
-		addr = page_address(page);
-		offset = pos % PAGE_SIZE;
-		attr_len = min_t(u32, count, PAGE_SIZE - (u32)offset);
-
-		lock_page(page);
-		memcpy(addr + offset, buf, attr_len);
-		written += attr_len;
-		buf += attr_len;
-		pos += attr_len;
-		count -= attr_len;
-
-		flush_dcache_page(page);
-		set_page_dirty(page);
-		if (sync)
-			wait_for_stable_page(page);
-		unlock_page(page);
-		kunmap(page);
-		put_page(page);
-		cond_resched();
-		index++;
-	}
-
-	return ret ? ret : written;
-}
-#endif
 
 s64 ntfs_inode_attr_pwrite(struct inode *vi, s64 pos, s64 count, u8 *buf, bool sync)
 {

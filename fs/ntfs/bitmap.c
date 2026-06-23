@@ -123,11 +123,7 @@ int __ntfs_bitmap_set_bits_in_run(struct inode *vi, const s64 start_bit,
 	s64 cnt = count;
 	pgoff_t index, end_index;
 	struct address_space *mapping;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	struct folio *folio;
-#else
-	struct page *page;
-#endif
 	u8 *kaddr;
 	int pos, len, err;
 	u8 bit;
@@ -151,7 +147,6 @@ int __ntfs_bitmap_set_bits_in_run(struct inode *vi, const s64 start_bit,
 
 	/* Get the page containing the first bit (@start_bit). */
 	mapping = vi->i_mapping;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	folio = read_mapping_folio(mapping, index, NULL);
 	if (IS_ERR(folio)) {
 		if (!is_rollback)
@@ -163,19 +158,6 @@ int __ntfs_bitmap_set_bits_in_run(struct inode *vi, const s64 start_bit,
 
 	folio_lock(folio);
 	kaddr = kmap_local_folio(folio, 0);
-#else
-	page = read_mapping_page(mapping, index, NULL);
-	if (IS_ERR(page)) {
-		if (!is_rollback)
-			ntfs_error(vi->i_sb,
-				"Failed to map first page (error %li), aborting.",
-				PTR_ERR(page));
-		return PTR_ERR(page);
-	}
-
-	lock_page(page);
-	kaddr = page_address(page);
-#endif
 
 	/* Set @pos to the position of the byte containing @start_bit. */
 	pos = (start_bit >> 3) & ~PAGE_MASK;
@@ -224,7 +206,6 @@ int __ntfs_bitmap_set_bits_in_run(struct inode *vi, const s64 start_bit,
 			goto rollback;
 		}
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 		/* Update @index and get the next folio. */
 		folio_mark_dirty(folio);
 		folio_unlock(folio);
@@ -241,24 +222,6 @@ int __ntfs_bitmap_set_bits_in_run(struct inode *vi, const s64 start_bit,
 
 		folio_lock(folio);
 		kaddr = kmap_local_folio(folio, 0);
-#else
-		/* Update @index and get the next page. */
-		set_page_dirty(page);
-		unlock_page(page);
-		kunmap(page);
-		put_page(page);
-		page = read_mapping_page(mapping, ++index, NULL);
-		if (IS_ERR(page)) {
-			ntfs_error(vi->i_sb,
-				   "Failed to map subsequent page (error %li), aborting.",
-				   PTR_ERR(page));
-			err = PTR_ERR(page);
-			goto rollback;
-		}
-
-		lock_page(page);
-		kaddr = page_address(page);
-#endif
 		/*
 		 * Depending on @value, modify all remaining whole bytes in the
 		 * page up to @cnt.
@@ -292,17 +255,10 @@ int __ntfs_bitmap_set_bits_in_run(struct inode *vi, const s64 start_bit,
 	}
 done:
 	/* We are done.  Unmap the folio and return success. */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	folio_mark_dirty(folio);
 	folio_unlock(folio);
 	kunmap_local(kaddr);
 	folio_put(folio);
-#else
-	set_page_dirty(page);
-	unlock_page(page);
-	kunmap(page);
-	put_page(page);
-#endif
 	ntfs_debug("Done.");
 	return 0;
 rollback:

@@ -16,6 +16,7 @@
  * Copyright (c) 2010 Erik Larsson
  */
 
+#include <linux/string_choices.h>
 #include <linux/writeback.h>
 #include <linux/iomap.h>
 
@@ -90,13 +91,9 @@ int ntfs_map_runlist_nolock(struct ntfs_inode *ni, s64 vcn, struct ntfs_attr_sea
 	struct mft_record *m;
 	struct attr_record *a;
 	struct runlist_element *rl;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	struct folio *put_this_folio = NULL;
-#else
-	struct page *put_this_page = NULL;
-#endif
 	int err = 0;
-	bool ctx_is_temporary = false, ctx_needs_reset;
+	bool ctx_is_temporary = false, ctx_needs_reset = false;
 	struct ntfs_attr_search_ctx old_ctx = { NULL, };
 	size_t new_rl_count;
 
@@ -159,13 +156,8 @@ int ntfs_map_runlist_nolock(struct ntfs_inode *ni, s64 vcn, struct ntfs_attr_sea
 			 */
 			if (old_ctx.base_ntfs_ino && old_ctx.ntfs_ino !=
 					old_ctx.base_ntfs_ino) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 				put_this_folio = old_ctx.ntfs_ino->folio;
 				folio_get(put_this_folio);
-#else
-				put_this_page = old_ctx.ntfs_ino->page;
-				get_page(put_this_page);
-#endif
 			}
 			/*
 			 * Reinitialize the search context so we can lookup the
@@ -285,13 +277,8 @@ retry_map:
 		 * immediately and mark the volume dirty for chkdsk to pick up
 		 * the pieces anyway.
 		 */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 		if (put_this_folio)
 			folio_put(put_this_folio);
-#else
-		if (put_this_page)
-			put_page(put_this_page);
-#endif
 	}
 	return err;
 }
@@ -602,11 +589,161 @@ static u32 ntfs_resident_attr_min_value_length(const __le32 type)
 			sizeof(__le16) * 1;
 	case AT_VOLUME_INFORMATION:
 		return sizeof(struct volume_information);
+	case AT_INDEX_ROOT:
+		return sizeof(struct index_root);
 	case AT_EA_INFORMATION:
 		return sizeof(struct ea_information);
 	default:
 		return 0;
 	}
+}
+
+static bool ntfs_attr_type_is_resident_only(const __le32 type)
+{
+	switch (type) {
+	case AT_STANDARD_INFORMATION:
+	case AT_FILE_NAME:
+	case AT_OBJECT_ID:
+	case AT_VOLUME_NAME:
+	case AT_VOLUME_INFORMATION:
+	case AT_INDEX_ROOT:
+	case AT_EA_INFORMATION:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static bool ntfs_file_name_attr_value_is_valid(const u8 *value, const u32 value_length)
+{
+	const struct file_name_attr *fn;
+	u32 file_name_size;
+
+	fn = (const struct file_name_attr *)value;
+	file_name_size = fn->file_name_length * sizeof(__le16);
+
+	return file_name_size <=
+			value_length - offsetof(struct file_name_attr, file_name);
+}
+
+static bool ntfs_volume_name_attr_value_is_valid(const u32 value_length)
+{
+	if (value_length & 1)
+		return false;
+
+	return value_length <= NTFS_MAX_LABEL_LEN * sizeof(__le16);
+}
+
+static bool ntfs_index_root_attr_value_is_valid(const u8 *value, const u32 value_length)
+{
+	const struct index_root *ir;
+	u32 index_size;
+	u32 entries_offset;
+	u32 index_length;
+	u32 allocated_size;
+
+	ir = (const struct index_root *)value;
+	index_size = value_length - offsetof(struct index_root, index);
+	entries_offset = le32_to_cpu(ir->index.entries_offset);
+	index_length = le32_to_cpu(ir->index.index_length);
+	allocated_size = le32_to_cpu(ir->index.allocated_size);
+
+	if ((entries_offset | index_length | allocated_size) & 7 ||
+	    entries_offset < sizeof(struct index_header) ||
+	    entries_offset > index_length ||
+	    index_length > allocated_size ||
+	    allocated_size > index_size ||
+	    index_length - entries_offset < sizeof(struct index_entry_header))
+		return false;
+
+	return true;
+}
+
+struct ntfs_resident_attr_value {
+	const u8 *data;
+	u32 len;
+};
+
+static bool ntfs_resident_attr_value_get(const struct attr_record *a,
+					 struct ntfs_resident_attr_value *value)
+{
+	u32 attr_len;
+	u16 value_offset;
+
+	attr_len = le32_to_cpu(a->length);
+	if (attr_len < offsetof(struct attr_record, data.resident.reserved) +
+			sizeof(a->data.resident.reserved))
+		return false;
+
+	value->len = le32_to_cpu(a->data.resident.value_length);
+	value_offset = le16_to_cpu(a->data.resident.value_offset);
+
+	if (value->len > attr_len || value_offset > attr_len - value->len)
+		return false;
+
+	value->data = (const u8 *)a + value_offset;
+	return true;
+}
+
+static bool ntfs_non_resident_attr_value_is_valid(const struct attr_record *a)
+{
+	u32 attr_len;
+	u32 min_len;
+	u16 mp_offset;
+
+	attr_len = le32_to_cpu(a->length);
+	min_len = offsetof(struct attr_record, data.non_resident.initialized_size) +
+		  sizeof(a->data.non_resident.initialized_size);
+	if (attr_len < min_len)
+		return false;
+
+	mp_offset = le16_to_cpu(a->data.non_resident.mapping_pairs_offset);
+	return mp_offset >= min_len && mp_offset <= attr_len;
+}
+
+static bool ntfs_attr_value_is_valid(struct ntfs_volume *vol,
+				     const struct attr_record *a,
+				     const u64 mft_no)
+{
+	struct ntfs_resident_attr_value value;
+	u32 min_len;
+
+	if (a->non_resident) {
+		if (ntfs_attr_type_is_resident_only(a->type))
+			goto corrupt;
+		if (!ntfs_non_resident_attr_value_is_valid(a))
+			goto corrupt;
+		return true;
+	}
+
+	if (!ntfs_resident_attr_value_get(a, &value))
+		goto corrupt;
+
+	min_len = ntfs_resident_attr_min_value_length(a->type);
+	if (min_len && value.len < min_len)
+		goto corrupt;
+
+	switch (a->type) {
+	case AT_FILE_NAME:
+		if (!ntfs_file_name_attr_value_is_valid(value.data, value.len))
+			goto corrupt;
+		break;
+	case AT_VOLUME_NAME:
+		if (!ntfs_volume_name_attr_value_is_valid(value.len))
+			goto corrupt;
+		break;
+	case AT_INDEX_ROOT:
+		if (!ntfs_index_root_attr_value_is_valid(value.data, value.len))
+			goto corrupt;
+		break;
+	}
+	return true;
+
+corrupt:
+	ntfs_error(vol->sb,
+		   "Corrupt %#x attribute in MFT record %llu\n",
+		   le32_to_cpu(a->type), mft_no);
+	return false;
 }
 
 /*
@@ -719,8 +856,11 @@ static int ntfs_attr_find(const __le32 type, const __le16 *name,
 			}
 		}
 
-		if (type == AT_UNUSED)
+		if (type == AT_UNUSED) {
+			if (!ntfs_attr_value_is_valid(vol, a, ctx->ntfs_ino->mft_no))
+				break;
 			return 0;
+		}
 		if (a->type != type)
 			continue;
 		/*
@@ -761,37 +901,8 @@ static int ntfs_attr_find(const __le32 type, const __le16 *name,
 			}
 		}
 
-		 /* Validate attribute's value offset/length */
-		if (!a->non_resident) {
-			u32 min_len;
-			u32 value_length = le32_to_cpu(a->data.resident.value_length);
-			u16 value_offset = le16_to_cpu(a->data.resident.value_offset);
-
-			if (value_length > le32_to_cpu(a->length) ||
-			    value_offset > le32_to_cpu(a->length) - value_length)
-				break;
-
-			min_len = ntfs_resident_attr_min_value_length(a->type);
-			if (min_len && value_length < min_len) {
-				ntfs_error(vol->sb,
-					   "Too small %#x resident attribute value in MFT record %lld\n",
-					   le32_to_cpu(a->type), (long long)ctx->ntfs_ino->mft_no);
-				break;
-			}
-		} else {
-			u32 min_len;
-			u16 mp_offset;
-
-			min_len = offsetof(struct attr_record, data.non_resident.initialized_size) +
-				  sizeof(a->data.non_resident.initialized_size);
-			if (le32_to_cpu(a->length) < min_len)
-				break;
-
-			mp_offset = le16_to_cpu(a->data.non_resident.mapping_pairs_offset);
-			if (mp_offset < min_len ||
-			    mp_offset > le32_to_cpu(a->length))
-				break;
-		}
+		if (!ntfs_attr_value_is_valid(vol, a, ctx->ntfs_ino->mft_no))
+			break;
 
 		/*
 		 * The names match or @name not present and attribute is
@@ -857,11 +968,71 @@ char *ntfs_attr_name_get(const struct ntfs_volume *vol, const __le16 *uname,
 	return NULL;
 }
 
+/*
+ * ntfs_attr_list_entry_is_valid - sanity check one $ATTRIBUTE_LIST entry
+ * @ale:	the attribute-list entry to check
+ * @al_end:	end of the attribute-list buffer @ale lives in
+ *
+ * Verify that @ale is a well-formed attr_list_entry wholly contained in
+ * [.., @al_end): its fixed header must lie in range before any field is
+ * dereferenced, its length must be a multiple of 8 that covers the fixed
+ * header plus the name, the name must lie within the buffer, the entry must
+ * be in use and carry a live MFT reference.  Return true if valid.
+ */
+bool ntfs_attr_list_entry_is_valid(const struct attr_list_entry *ale,
+				   const u8 *al_end)
+{
+	const u8 *al = (const u8 *)ale;
+	u16 ale_len;
+
+	/* The fixed header must be in bounds before it is parsed. */
+	if (al + offsetof(struct attr_list_entry, name) > al_end)
+		return false;
+	ale_len = le16_to_cpu(ale->length);
+	/* On-disk entries are 8-byte aligned (see struct attr_list_entry). */
+	if (ale_len & 7)
+		return false;
+	if (ale->name_offset != sizeof(struct attr_list_entry))
+		return false;
+	if ((u32)ale->name_offset +
+	    (u32)ale->name_length * sizeof(__le16) > ale_len ||
+	    al + ale_len > al_end)
+		return false;
+	if (ale->type == AT_UNUSED)
+		return false;
+	if (MSEQNO_LE(ale->mft_reference) == 0)
+		return false;
+	return true;
+}
+
+/*
+ * ntfs_attr_list_is_valid - sanity check an in-memory $ATTRIBUTE_LIST
+ * @al_start:	start of the attribute list buffer
+ * @size:	length of the attribute list in bytes
+ *
+ * Verify that [@al_start, @al_start + @size) is a sequence of valid
+ * attr_list_entry records (see ntfs_attr_list_entry_is_valid()) that tile the
+ * buffer exactly.  Return true if valid, false otherwise.
+ */
+bool ntfs_attr_list_is_valid(const u8 *al_start, s64 size)
+{
+	const u8 *al = al_start;
+	const u8 *al_end = al_start + size;
+
+	while (al < al_end) {
+		const struct attr_list_entry *ale =
+				(const struct attr_list_entry *)al;
+
+		if (!ntfs_attr_list_entry_is_valid(ale, al_end))
+			return false;
+		al += le16_to_cpu(ale->length);
+	}
+	return al == al_end;
+}
+
 int load_attribute_list(struct ntfs_inode *base_ni, u8 *al_start, const s64 size)
 {
 	struct inode *attr_vi = NULL;
-	u8 *al;
-	struct attr_list_entry *ale;
 
 	if (!al_start || size <= 0)
 		return -EINVAL;
@@ -883,19 +1054,7 @@ int load_attribute_list(struct ntfs_inode *base_ni, u8 *al_start, const s64 size
 	}
 	iput(attr_vi);
 
-	for (al = al_start; al < al_start + size; al += le16_to_cpu(ale->length)) {
-		ale = (struct attr_list_entry *)al;
-		if (ale->name_offset != sizeof(struct attr_list_entry))
-			break;
-		if (le16_to_cpu(ale->length) <= ale->name_offset + ale->name_length ||
-		    al + le16_to_cpu(ale->length) > al_start + size)
-			break;
-		if (ale->type == AT_UNUSED)
-			break;
-		if (MSEQNO_LE(ale->mft_reference) == 0)
-			break;
-	}
-	if (al != al_start + size) {
+	if (!ntfs_attr_list_is_valid(al_start, size)) {
 		ntfs_error(base_ni->vol->sb, "Corrupt attribute list, mft = %llu",
 			   base_ni->mft_no);
 		return -EIO;
@@ -1151,9 +1310,8 @@ find_attr_list_attr:
 		 * we have reached the right one or the search has failed.
 		 */
 		if (lowest_vcn && (u8 *)next_al_entry >= al_start &&
-				(u8 *)next_al_entry + 6 < al_end &&
-				(u8 *)next_al_entry + le16_to_cpu(
-					next_al_entry->length) <= al_end &&
+				ntfs_attr_list_entry_is_valid(next_al_entry,
+							      al_end) &&
 				le64_to_cpu(next_al_entry->lowest_vcn) <=
 					lowest_vcn &&
 				next_al_entry->type == al_entry->type &&
@@ -1266,22 +1424,8 @@ do_next_attr_loop:
 
 		ctx->attr = a;
 
-		if (a->non_resident) {
-			u32 min_len;
-			u16 mp_offset;
-
-			min_len = offsetof(struct attr_record,
-					   data.non_resident.initialized_size) +
-				  sizeof(a->data.non_resident.initialized_size);
-
-			if (le32_to_cpu(a->length) < min_len)
-				break;
-
-			mp_offset =
-				le16_to_cpu(a->data.non_resident.mapping_pairs_offset);
-			if (mp_offset < min_len || mp_offset > attr_len)
-				break;
-		}
+		if (!ntfs_attr_value_is_valid(vol, a, ctx->ntfs_ino->mft_no))
+			break;
 
 		/*
 		 * If no @val specified or @val specified and it matches, we
@@ -1293,19 +1437,6 @@ do_next_attr_loop:
 			u32 value_length = le32_to_cpu(a->data.resident.value_length);
 			u16 value_offset = le16_to_cpu(a->data.resident.value_offset);
 
-			if (attr_len < offsetof(struct attr_record, data.resident.reserved) +
-					sizeof(a->data.resident.reserved))
-				break;
-			if (value_length > attr_len || value_offset > attr_len - value_length)
-				break;
-
-			value_length = ntfs_resident_attr_min_value_length(a->type);
-			if (value_length && le32_to_cpu(a->data.resident.value_length) <
-			    value_length) {
-				pr_err("Too small resident attribute value in MFT record %lld, type %#x\n",
-				       (long long)ctx->ntfs_ino->mft_no, a->type);
-				break;
-			}
 			if (value_length == val_len &&
 			    !memcmp((u8 *)a + value_offset, val, val_len)) {
 attr_found:
@@ -1783,11 +1914,7 @@ int ntfs_attr_make_non_resident(struct ntfs_inode *ni, const u32 data_size)
 	struct mft_record *m;
 	struct attr_record *a;
 	struct ntfs_attr_search_ctx *ctx;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	struct folio *folio;
-#else
-	struct page *page;
-#endif
 	struct runlist_element *rl;
 	unsigned long flags;
 	int mp_size, mp_ofs, name_ofs, arec_size, err, err2;
@@ -1858,7 +1985,6 @@ int ntfs_attr_make_non_resident(struct ntfs_inode *ni, const u32 data_size)
 		 * Will need folio later and since folio lock nests
 		 * outside all ntfs locks, we need to get the folio now.
 		 */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 		folio = __filemap_get_folio(vi->i_mapping, 0,
 					    FGP_CREAT | FGP_LOCK,
 					    mapping_gfp_mask(vi->i_mapping));
@@ -1866,14 +1992,6 @@ int ntfs_attr_make_non_resident(struct ntfs_inode *ni, const u32 data_size)
 			err = -ENOMEM;
 			goto err_out;
 		}
-#else
-		page = find_or_create_page(vi->i_mapping, 0,
-				mapping_gfp_mask(vi->i_mapping));
-		if (unlikely(!page)) {
-			err = -ENOMEM;
-			goto err_out;
-		}
-#endif
 
 		/* Start by allocating clusters to hold the attribute value. */
 		rl = ntfs_cluster_alloc(vol, 0,
@@ -1882,17 +2000,13 @@ int ntfs_attr_make_non_resident(struct ntfs_inode *ni, const u32 data_size)
 		if (IS_ERR(rl)) {
 			err = PTR_ERR(rl);
 			ntfs_debug("Failed to allocate cluster%s, error code %i.",
-					ntfs_bytes_to_cluster(vol, new_size) > 1 ? "s" : "",
+					str_plural(ntfs_bytes_to_cluster(vol, new_size)),
 					err);
 			goto folio_err_out;
 		}
 	} else {
 		rl = NULL;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 		folio = NULL;
-#else
-		page = NULL;
-#endif
 	}
 
 	down_write(&ni->runlist.lock);
@@ -1932,35 +2046,12 @@ int ntfs_attr_make_non_resident(struct ntfs_inode *ni, const u32 data_size)
 	 */
 	attr_size = le32_to_cpu(a->data.resident.value_length);
 	WARN_ON(attr_size != data_size);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	if (folio && !folio_test_uptodate(folio)) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
 		folio_fill_tail(folio, 0, (u8 *)a +
 				le16_to_cpu(a->data.resident.value_offset),
 				attr_size);
-#else
-		memcpy_to_folio(folio, 0, (u8 *)a +
-				le16_to_cpu(a->data.resident.value_offset),
-				attr_size);
-		folio_zero_segment(folio, offset_in_folio(folio, attr_size),
-				   folio_size(folio) - attr_size);
-#endif
 		folio_mark_uptodate(folio);
 	}
-#else
-	if (page && !PageUptodate(page)) {
-		u8 *kaddr;
-
-		kaddr = kmap_atomic(page);
-		memcpy(kaddr, (u8 *)a +
-				le16_to_cpu(a->data.resident.value_offset),
-				attr_size);
-		memset(kaddr + attr_size, 0, PAGE_SIZE - attr_size);
-		kunmap_atomic(kaddr);
-		flush_dcache_page(page);
-		SetPageUptodate(page);
-	}
-#endif
 
 	/* Backup the attribute flag. */
 	old_res_attr_flags = a->data.resident.flags;
@@ -2049,19 +2140,11 @@ int ntfs_attr_make_non_resident(struct ntfs_inode *ni, const u32 data_size)
 	ntfs_attr_put_search_ctx(ctx);
 	unmap_mft_record(base_ni);
 	up_write(&ni->runlist.lock);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	if (folio) {
 		iomap_dirty_folio(vi->i_mapping, folio);
 		folio_unlock(folio);
 		folio_put(folio);
 	}
-#else
-	if (page) {
-		set_page_dirty(page);
-		unlock_page(page);
-		put_page(page);
-	}
-#endif
 	ntfs_debug("Done.");
 	return 0;
 undo_err_out:
@@ -2109,18 +2192,8 @@ undo_err_out:
 	memset(&a->data.resident.reserved, 0,
 			sizeof(a->data.resident.reserved));
 	/* Copy the data from folio back to the attribute value. */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	if (folio)
 		memcpy_from_folio((u8 *)a + mp_ofs, folio, 0, attr_size);
-#else
-	if (page) {
-		u8 *kaddr;
-
-		kaddr = kmap_atomic(page);
-		memcpy((u8 *)a + mp_ofs, kaddr, attr_size);
-		kunmap_atomic(kaddr);
-	}
-#endif
 	/* Setup the allocated size in the ntfs inode in case it changed. */
 	write_lock_irqsave(&ni->size_lock, flags);
 	ni->allocated_size = arec_size - mp_ofs;
@@ -2137,13 +2210,8 @@ rl_err_out:
 		}
 		kvfree(rl);
 folio_err_out:
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 		folio_unlock(folio);
 		folio_put(folio);
-#else
-		unlock_page(page);
-		put_page(page);
-#endif
 	}
 err_out:
 	if (ctx)
@@ -2173,7 +2241,6 @@ err_out:
  * Thus it relies on the vm dirty page write code paths to cause the modified
  * pages to be written to the mft record/disk.
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
 int ntfs_attr_set(struct ntfs_inode *ni, s64 ofs, s64 cnt, const u8 val)
 {
 	struct address_space *mapping = VFS_I(ni)->i_mapping;
@@ -2214,118 +2281,6 @@ int ntfs_attr_set(struct ntfs_inode *ni, s64 ofs, s64 cnt, const u8 val)
 
 	return ret;
 }
-#else
-int ntfs_attr_set(struct ntfs_inode *ni, const s64 ofs, const s64 cnt, const u8 val)
-{
-	struct ntfs_volume *vol = ni->vol;
-	struct address_space *mapping;
-	struct page *page;
-	u8 *kaddr;
-	pgoff_t idx, end;
-	unsigned int start_ofs, end_ofs, size;
-
-	ntfs_debug("Entering for ofs 0x%llx, cnt 0x%llx, val 0x%x.",
-			(long long)ofs, (long long)cnt, val);
-	WARN_ON(ofs < 0);
-	WARN_ON(cnt < 0);
-	if (!cnt)
-		goto done;
-	WARN_ON(NInoCompressed(ni));
-	WARN_ON(NInoEncrypted(ni));
-	mapping = VFS_I(ni)->i_mapping;
-	/* Work out the starting index and page offset. */
-	idx = ofs >> PAGE_SHIFT;
-	start_ofs = ofs & ~PAGE_MASK;
-	/* Work out the ending index and page offset. */
-	end = ofs + cnt;
-	end_ofs = end & ~PAGE_MASK;
-	/* If the end is outside the inode size return -ESPIPE. */
-	if (unlikely(end > i_size_read(VFS_I(ni)))) {
-		ntfs_error(vol->sb, "Request exceeds end of attribute.");
-		return -ESPIPE;
-	}
-	end >>= PAGE_SHIFT;
-	/* If there is a first partial page, need to do it the slow way. */
-	if (start_ofs) {
-		page = read_mapping_page(mapping, idx, NULL);
-		if (IS_ERR(page)) {
-			ntfs_error(vol->sb,
-				"Failed to read first partial page (error, index 0x%lx).",
-				idx);
-			return PTR_ERR(page);
-		}
-
-		lock_page(page);
-		/*
-		 * If the last page is the same as the first page, need to
-		 * limit the write to the end offset.
-		 */
-		size = PAGE_SIZE;
-		if (idx == end)
-			size = end_ofs;
-		kaddr = kmap_atomic(page);
-		memset(kaddr + start_ofs, val, size - start_ofs);
-		kunmap_atomic(kaddr);
-		set_page_dirty(page);
-		unlock_page(page);
-		put_page(page);
-		balance_dirty_pages_ratelimited(mapping);
-		cond_resched();
-		if (idx == end)
-			goto done;
-		idx++;
-	}
-	/* Do the whole pages the fast way. */
-	for (; idx < end; idx++) {
-		/* Find or create the current page.  (The page is locked.) */
-		page = grab_cache_page(mapping, idx);
-		if (unlikely(!page)) {
-			ntfs_error(vol->sb,
-				"Insufficient memory to grab page (index 0x%lx).",
-				idx);
-			return -ENOMEM;
-		}
-		kaddr = kmap_atomic(page);
-		memset(kaddr, val, PAGE_SIZE);
-		kunmap_atomic(kaddr);
-		/* Now that buffers are uptodate, set the page uptodate, too. */
-		SetPageUptodate(page);
-		/*
-		 * Set the page and all its buffers dirty and mark the inode
-		 * dirty, too.  The VM will write the page later on.
-		 */
-		set_page_dirty(page);
-		/* Finally unlock and release the page. */
-		unlock_page(page);
-		put_page(page);
-		balance_dirty_pages_ratelimited(mapping);
-		cond_resched();
-	}
-	/* If there is a last partial page, need to do it the slow way. */
-	if (end_ofs) {
-		page = read_mapping_page(mapping, idx, NULL);
-		if (IS_ERR(page)) {
-			ntfs_error(vol->sb,
-				"Failed to read last partial page (error, index 0x%lx).",
-				idx);
-			return PTR_ERR(page);
-		}
-
-		lock_page(page);
-		kaddr = kmap_atomic(page);
-		memset(kaddr, val, end_ofs);
-		kunmap_atomic(kaddr);
-		set_page_dirty(page);
-		unlock_page(page);
-		put_page(page);
-		balance_dirty_pages_ratelimited(mapping);
-		cond_resched();
-	}
-done:
-	ntfs_debug("Done.");
-	return 0;
-}
-#endif
 
 int ntfs_attr_set_initialized_size(struct ntfs_inode *ni, loff_t new_size)
 {
@@ -2372,7 +2327,7 @@ static int ntfs_make_room_for_attr(struct mft_record *m, u8 *pos, u32 size)
 
 	/* Rigorous consistency checks. */
 	if (!m || !pos || pos < (u8 *)m) {
-		pr_err("%s: pos=%p  m=%p", __func__, pos, m);
+		pr_err("%s: pos=%p  m=%p\n", __func__, pos, m);
 		return -EINVAL;
 	}
 
@@ -2550,16 +2505,16 @@ static int ntfs_non_resident_attr_record_add(struct ntfs_inode *ni, __le32 type,
 	err = ntfs_attr_can_be_non_resident(ni->vol, type);
 	if (err) {
 		if (err == -EPERM)
-			pr_err("Attribute can't be non resident");
+			pr_err("Attribute can't be non resident\n");
 		else
-			pr_err("ntfs_attr_can_be_non_resident failed");
+			pr_err("ntfs_attr_can_be_non_resident failed\n");
 		return err;
 	}
 
 	/* Locate place where record should be. */
 	ctx = ntfs_attr_get_search_ctx(ni, NULL);
 	if (!ctx) {
-		pr_err("%s: Failed to get search context", __func__);
+		pr_err("%s: Failed to get search context\n", __func__);
 		return -ENOMEM;
 	}
 	/*
@@ -2570,11 +2525,11 @@ static int ntfs_non_resident_attr_record_add(struct ntfs_inode *ni, __le32 type,
 	err = ntfs_attr_find(type, name, name_len, CASE_SENSITIVE, NULL, 0, ctx);
 	if (!err) {
 		err = -EEXIST;
-		pr_err("Attribute 0x%x already present", type);
+		pr_err("Attribute 0x%x already present\n", type);
 		goto put_err_out;
 	}
 	if (err != -ENOENT) {
-		pr_err("ntfs_attr_find failed");
+		pr_err("ntfs_attr_find failed\n");
 		err = -EIO;
 		goto put_err_out;
 	}
@@ -2589,7 +2544,7 @@ static int ntfs_non_resident_attr_record_add(struct ntfs_inode *ni, __le32 type,
 		 sizeof(a->data.non_resident.compressed_size) : 0);
 	err = ntfs_make_room_for_attr(ctx->mrec, (u8 *) ctx->attr, length);
 	if (err) {
-		pr_err("Failed to make room for attribute");
+		pr_err("Failed to make room for attribute\n");
 		goto put_err_out;
 	}
 
@@ -2629,7 +2584,7 @@ static int ntfs_non_resident_attr_record_add(struct ntfs_inode *ni, __le32 type,
 	if (type != AT_ATTRIBUTE_LIST && NInoAttrList(base_ni)) {
 		err = ntfs_attrlist_entry_add(ni, a);
 		if (err) {
-			pr_err("Failed add attr entry to attrlist");
+			pr_err("Failed add attr entry to attrlist\n");
 			ntfs_attr_record_resize(m, a, 0);
 			goto put_err_out;
 		}
@@ -2644,7 +2599,7 @@ static int ntfs_non_resident_attr_record_add(struct ntfs_inode *ni, __le32 type,
 	err = ntfs_attr_lookup(type, name, name_len, CASE_SENSITIVE,
 				lowest_vcn, NULL, 0, ctx);
 	if (err) {
-		pr_err("%s: attribute lookup failed", __func__);
+		pr_err("%s: attribute lookup failed\n", __func__);
 		ntfs_attr_put_search_ctx(ctx);
 		return err;
 
@@ -3135,7 +3090,7 @@ int ntfs_attr_open(struct ntfs_inode *ni, const __le32 type,
 	ctx = ntfs_attr_get_search_ctx(base_ni, NULL);
 	if (!ctx) {
 		err = -ENOMEM;
-		pr_err("%s: Failed to get search context", __func__);
+		pr_err("%s: Failed to get search context\n", __func__);
 		goto err_out;
 	}
 
@@ -4726,10 +4681,12 @@ attr_resize_again:
 	while (!(err = ntfs_attr_lookup(AT_UNUSED, NULL, 0, 0, 0, NULL, 0, ctx))) {
 		struct inode *tvi;
 		struct attr_record *a;
+		u32 value_len;
 
 		a = ctx->attr;
 		if (a->non_resident || a->type == AT_ATTRIBUTE_LIST)
 			continue;
+		value_len = le32_to_cpu(a->data.resident.value_length);
 
 		if (ntfs_attr_can_be_non_resident(vol, a->type))
 			continue;
@@ -4740,6 +4697,8 @@ attr_resize_again:
 		 */
 		if (le32_to_cpu(a->length) <= (sizeof(struct attr_record) - sizeof(s64)) +
 				((a->name_length * sizeof(__le16) + 7) & ~7) + 8)
+			continue;
+		if (a->type == AT_DATA && !value_len)
 			continue;
 
 		if (a->type == AT_DATA)
@@ -4753,8 +4712,7 @@ attr_resize_again:
 			continue;
 		}
 
-		if (ntfs_attr_make_non_resident(NTFS_I(tvi),
-		    le32_to_cpu(ctx->attr->data.resident.value_length))) {
+		if (ntfs_attr_make_non_resident(NTFS_I(tvi), value_len)) {
 			iput(tvi);
 			continue;
 		}
@@ -4925,7 +4883,7 @@ int ntfs_attr_expand(struct ntfs_inode *ni, const s64 newsize, const s64 preallo
 	 * which is what Windows NT4 does, too.
 	 */
 	if (NInoEncrypted(ni)) {
-		pr_err("Failed to truncate encrypted attribute");
+		pr_err("Failed to truncate encrypted attribute\n");
 		return -EACCES;
 	}
 
@@ -4979,12 +4937,12 @@ int ntfs_attr_truncate_i(struct ntfs_inode *ni, const s64 newsize, unsigned int 
 	 * which is what Windows NT4 does, too.
 	 */
 	if (NInoEncrypted(ni)) {
-		pr_err("Failed to truncate encrypted attribute");
+		pr_err("Failed to truncate encrypted attribute\n");
 		return -EACCES;
 	}
 
 	if (NInoCompressed(ni)) {
-		pr_err("Failed to truncate compressed attribute");
+		pr_err("Failed to truncate compressed attribute\n");
 		return -EOPNOTSUPP;
 	}
 
