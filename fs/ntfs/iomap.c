@@ -1066,13 +1066,8 @@ const struct iomap_writeback_ops ntfs_writeback_ops = {
 	.writeback_submit	= iomap_ioend_writeback_submit,
 };
 #else
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 9, 0)
 static int ntfs_write_map_blocks(struct iomap_writepage_ctx *wpc,
 		struct inode *inode, loff_t offset, unsigned int len)
-#else
-static int ntfs_write_map_blocks(struct iomap_writepage_ctx *wpc,
-		struct inode *inode, loff_t offset)
-#endif
 {
 	/* If the mapping is already OK, nothing needs to be done */
 	if (offset >= wpc->iomap.offset &&
