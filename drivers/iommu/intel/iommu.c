@@ -282,7 +282,6 @@ static LIST_HEAD(dmar_satc_units);
 #define for_each_rmrr_units(rmrr) \
 	list_for_each_entry(rmrr, &dmar_rmrr_units, list)
 
-static void device_block_translation(struct device *dev);
 static void intel_iommu_domain_free(struct iommu_domain *domain);
 
 int dmar_disabled = !IS_ENABLED(CONFIG_INTEL_IOMMU_DEFAULT_ON);
@@ -541,8 +540,6 @@ static int domain_update_device_node(struct dmar_domain *domain)
 	return nid;
 }
 
-static void domain_update_iotlb(struct dmar_domain *domain);
-
 /* Return the super pagesize bitmap if supported. */
 static unsigned long domain_super_pgsize_bitmap(struct dmar_domain *domain)
 {
@@ -561,7 +558,7 @@ static unsigned long domain_super_pgsize_bitmap(struct dmar_domain *domain)
 }
 
 /* Some capabilities may be different across iommus */
-static void domain_update_iommu_cap(struct dmar_domain *domain)
+void domain_update_iommu_cap(struct dmar_domain *domain)
 {
 	domain_update_iommu_coherency(domain);
 	domain->iommu_superpage = domain_update_iommu_superpage(domain, NULL);
@@ -1375,7 +1372,7 @@ domain_lookup_dev_info(struct dmar_domain *domain,
 	return NULL;
 }
 
-static void domain_update_iotlb(struct dmar_domain *domain)
+void domain_update_iotlb(struct dmar_domain *domain)
 {
 	struct dev_pasid_info *dev_pasid;
 	struct device_domain_info *info;
@@ -1525,6 +1522,46 @@ static void domain_flush_pasid_iotlb(struct intel_iommu *iommu,
 	spin_unlock_irqrestore(&domain->lock, flags);
 }
 
+static void __iommu_flush_iotlb_psi(struct intel_iommu *iommu, u16 did,
+				    unsigned long pfn, unsigned int pages,
+				    int ih)
+{
+	unsigned int aligned_pages = __roundup_pow_of_two(pages);
+	unsigned long bitmask = aligned_pages - 1;
+	unsigned int mask = ilog2(aligned_pages);
+	u64 addr = (u64)pfn << VTD_PAGE_SHIFT;
+
+	/*
+	 * PSI masks the low order bits of the base address. If the
+	 * address isn't aligned to the mask, then compute a mask value
+	 * needed to ensure the target range is flushed.
+	 */
+	if (unlikely(bitmask & pfn)) {
+		unsigned long end_pfn = pfn + pages - 1, shared_bits;
+
+		/*
+		 * Since end_pfn <= pfn + bitmask, the only way bits
+		 * higher than bitmask can differ in pfn and end_pfn is
+		 * by carrying. This means after masking out bitmask,
+		 * high bits starting with the first set bit in
+		 * shared_bits are all equal in both pfn and end_pfn.
+		 */
+		shared_bits = ~(pfn ^ end_pfn) & ~bitmask;
+		mask = shared_bits ? __ffs(shared_bits) : BITS_PER_LONG;
+	}
+
+	/*
+	 * Fallback to domain selective flush if no PSI support or
+	 * the size is too big.
+	 */
+	if (!cap_pgsel_inv(iommu->cap) || mask > cap_max_amask_val(iommu->cap))
+		iommu->flush.flush_iotlb(iommu, did, 0, 0,
+					 DMA_TLB_DSI_FLUSH);
+	else
+		iommu->flush.flush_iotlb(iommu, did, addr | ih, mask,
+					 DMA_TLB_PSI_FLUSH);
+}
+
 static void iommu_flush_iotlb_psi(struct intel_iommu *iommu,
 				  struct dmar_domain *domain,
 				  unsigned long pfn, unsigned int pages,
@@ -1541,42 +1578,10 @@ static void iommu_flush_iotlb_psi(struct intel_iommu *iommu,
 	if (ih)
 		ih = 1 << 6;
 
-	if (domain->use_first_level) {
+	if (domain->use_first_level)
 		domain_flush_pasid_iotlb(iommu, domain, addr, pages, ih);
-	} else {
-		unsigned long bitmask = aligned_pages - 1;
-
-		/*
-		 * PSI masks the low order bits of the base address. If the
-		 * address isn't aligned to the mask, then compute a mask value
-		 * needed to ensure the target range is flushed.
-		 */
-		if (unlikely(bitmask & pfn)) {
-			unsigned long end_pfn = pfn + pages - 1, shared_bits;
-
-			/*
-			 * Since end_pfn <= pfn + bitmask, the only way bits
-			 * higher than bitmask can differ in pfn and end_pfn is
-			 * by carrying. This means after masking out bitmask,
-			 * high bits starting with the first set bit in
-			 * shared_bits are all equal in both pfn and end_pfn.
-			 */
-			shared_bits = ~(pfn ^ end_pfn) & ~bitmask;
-			mask = shared_bits ? __ffs(shared_bits) : BITS_PER_LONG;
-		}
-
-		/*
-		 * Fallback to domain selective flush if no PSI support or
-		 * the size is too big.
-		 */
-		if (!cap_pgsel_inv(iommu->cap) ||
-		    mask > cap_max_amask_val(iommu->cap))
-			iommu->flush.flush_iotlb(iommu, did, 0, 0,
-							DMA_TLB_DSI_FLUSH);
-		else
-			iommu->flush.flush_iotlb(iommu, did, addr | ih, mask,
-							DMA_TLB_PSI_FLUSH);
-	}
+	else
+		__iommu_flush_iotlb_psi(iommu, did, pfn, pages, ih);
 
 	/*
 	 * In caching mode, changes of pages from non-present to present require
@@ -1601,6 +1606,46 @@ static inline void __mapping_notify_one(struct intel_iommu *iommu,
 		iommu_flush_write_buffer(iommu);
 }
 
+/*
+ * Flush the relevant caches in nested translation if the domain
+ * also serves as a parent
+ */
+static void parent_domain_flush(struct dmar_domain *domain,
+				unsigned long pfn,
+				unsigned long pages, int ih)
+{
+	struct dmar_domain *s1_domain;
+
+	spin_lock(&domain->s1_lock);
+	list_for_each_entry(s1_domain, &domain->s1_domains, s2_link) {
+		struct device_domain_info *device_info;
+		struct iommu_domain_info *info;
+		unsigned long flags;
+		unsigned long i;
+
+		xa_for_each(&s1_domain->iommu_array, i, info)
+			__iommu_flush_iotlb_psi(info->iommu, info->did,
+						pfn, pages, ih);
+
+		if (!s1_domain->has_iotlb_device)
+			continue;
+
+		spin_lock_irqsave(&s1_domain->lock, flags);
+		list_for_each_entry(device_info, &s1_domain->devices, link)
+			/*
+			 * Address translation cache in device side caches the
+			 * result of nested translation. There is no easy way
+			 * to identify the exact set of nested translations
+			 * affected by a change in S2. So just flush the entire
+			 * device cache.
+			 */
+			__iommu_flush_dev_iotlb(device_info, 0,
+						MAX_AGAW_PFN_WIDTH);
+		spin_unlock_irqrestore(&s1_domain->lock, flags);
+	}
+	spin_unlock(&domain->s1_lock);
+}
+
 static void intel_flush_iotlb_all(struct iommu_domain *domain)
 {
 	struct dmar_domain *dmar_domain = to_dmar_domain(domain);
@@ -1620,6 +1665,9 @@ static void intel_flush_iotlb_all(struct iommu_domain *domain)
 		if (!cap_caching_mode(iommu->cap))
 			iommu_flush_dev_iotlb(dmar_domain, 0, MAX_AGAW_PFN_WIDTH);
 	}
+
+	if (dmar_domain->nested_parent)
+		parent_domain_flush(dmar_domain, 0, -1, 0);
 }
 
 static void iommu_disable_protect_mem_regions(struct intel_iommu *iommu)
@@ -1791,8 +1839,7 @@ static struct dmar_domain *alloc_domain(unsigned int type)
 	return domain;
 }
 
-static int domain_attach_iommu(struct dmar_domain *domain,
-			       struct intel_iommu *iommu)
+int domain_attach_iommu(struct dmar_domain *domain, struct intel_iommu *iommu)
 {
 	struct iommu_domain_info *info, *curr;
 	unsigned long ndomains;
@@ -1841,8 +1888,7 @@ err_unlock:
 	return ret;
 }
 
-static void domain_detach_iommu(struct dmar_domain *domain,
-				struct intel_iommu *iommu)
+void domain_detach_iommu(struct dmar_domain *domain, struct intel_iommu *iommu)
 {
 	struct iommu_domain_info *info;
 
@@ -2187,6 +2233,9 @@ static void switch_to_super_page(struct dmar_domain *domain,
 				iommu_flush_iotlb_psi(info->iommu, domain,
 						      start_pfn, lvl_pages,
 						      0, 0);
+			if (domain->nested_parent)
+				parent_domain_flush(domain, start_pfn,
+						    lvl_pages, 0);
 		}
 
 		pte++;
@@ -4044,7 +4093,7 @@ static void dmar_remove_one_dev_info(struct device *dev)
  * all DMA requests without PASID from the device are blocked. If the page
  * table has been set, clean up the data structures.
  */
-static void device_block_translation(struct device *dev)
+void device_block_translation(struct device *dev)
 {
 	struct device_domain_info *info = dev_iommu_priv_get(dev);
 	struct intel_iommu *iommu = info->iommu;
@@ -4099,9 +4148,9 @@ static int blocking_domain_attach_dev(struct iommu_domain *domain,
 }
 
 static struct iommu_domain blocking_domain = {
+	.type = IOMMU_DOMAIN_BLOCKED,
 	.ops = &(const struct iommu_domain_ops) {
 		.attach_dev	= blocking_domain_attach_dev,
-		.free		= intel_iommu_domain_free
 	}
 };
 
@@ -4145,38 +4194,50 @@ static struct iommu_domain *intel_iommu_domain_alloc(unsigned type)
 }
 
 static struct iommu_domain *
-intel_iommu_domain_alloc_user(struct device *dev, u32 flags)
+intel_iommu_domain_alloc_user(struct device *dev, u32 flags,
+			      struct iommu_domain *parent,
+			      const struct iommu_user_data *user_data)
 {
+	struct device_domain_info *info = dev_iommu_priv_get(dev);
+	bool dirty_tracking = flags & IOMMU_HWPT_ALLOC_DIRTY_TRACKING;
+	bool nested_parent = flags & IOMMU_HWPT_ALLOC_NEST_PARENT;
+	struct intel_iommu *iommu = info->iommu;
+	struct dmar_domain *dmar_domain;
 	struct iommu_domain *domain;
-	struct intel_iommu *iommu;
-	bool dirty_tracking;
+
+	/* Must be NESTING domain */
+	if (parent) {
+		if (!nested_supported(iommu) || flags)
+			return ERR_PTR(-EOPNOTSUPP);
+		return intel_nested_domain_alloc(parent, user_data);
+	}
 
 	if (flags &
 	    (~(IOMMU_HWPT_ALLOC_NEST_PARENT | IOMMU_HWPT_ALLOC_DIRTY_TRACKING)))
 		return ERR_PTR(-EOPNOTSUPP);
-
-	iommu = device_to_iommu(dev, NULL, NULL);
-	if (!iommu)
-		return ERR_PTR(-ENODEV);
-
-	if ((flags & IOMMU_HWPT_ALLOC_NEST_PARENT) && !nested_supported(iommu))
+	if (nested_parent && !nested_supported(iommu))
 		return ERR_PTR(-EOPNOTSUPP);
-
-	dirty_tracking = (flags & IOMMU_HWPT_ALLOC_DIRTY_TRACKING);
-	if (dirty_tracking && !ssads_supported(iommu))
+	if (user_data || (dirty_tracking && !ssads_supported(iommu)))
 		return ERR_PTR(-EOPNOTSUPP);
 
 	/*
-	 * domain_alloc_user op needs to fully initialize a domain
-	 * before return, so uses iommu_domain_alloc() here for
-	 * simple.
+	 * domain_alloc_user op needs to fully initialize a domain before
+	 * return, so uses iommu_domain_alloc() here for simple.
 	 */
 	domain = iommu_domain_alloc(dev->bus);
 	if (!domain)
-		domain = ERR_PTR(-ENOMEM);
+		return ERR_PTR(-ENOMEM);
 
-	if (!IS_ERR(domain) && dirty_tracking) {
-		if (to_dmar_domain(domain)->use_first_level) {
+	dmar_domain = to_dmar_domain(domain);
+
+	if (nested_parent) {
+		dmar_domain->nested_parent = true;
+		INIT_LIST_HEAD(&dmar_domain->s1_domains);
+		spin_lock_init(&dmar_domain->s1_lock);
+	}
+
+	if (dirty_tracking) {
+		if (dmar_domain->use_first_level) {
 			iommu_domain_free(domain);
 			return ERR_PTR(-EOPNOTSUPP);
 		}
@@ -4188,12 +4249,16 @@ intel_iommu_domain_alloc_user(struct device *dev, u32 flags)
 
 static void intel_iommu_domain_free(struct iommu_domain *domain)
 {
-	if (domain != &si_domain->domain && domain != &blocking_domain)
-		domain_exit(to_dmar_domain(domain));
+	struct dmar_domain *dmar_domain = to_dmar_domain(domain);
+
+	WARN_ON(dmar_domain->nested_parent &&
+		!list_empty(&dmar_domain->s1_domains));
+	if (domain != &si_domain->domain)
+		domain_exit(dmar_domain);
 }
 
-static int prepare_domain_attach_device(struct iommu_domain *domain,
-					struct device *dev)
+int prepare_domain_attach_device(struct iommu_domain *domain,
+				 struct device *dev)
 {
 	struct dmar_domain *dmar_domain = to_dmar_domain(domain);
 	struct intel_iommu *iommu;
@@ -4374,6 +4439,9 @@ static void intel_iommu_tlb_sync(struct iommu_domain *domain,
 				      start_pfn, nrpages,
 				      list_empty(&gather->freelist), 0);
 
+	if (dmar_domain->nested_parent)
+		parent_domain_flush(dmar_domain, start_pfn, nrpages,
+				    list_empty(&gather->freelist));
 	put_pages_list(&gather->freelist);
 }
 
@@ -4927,21 +4995,70 @@ static void *intel_iommu_hw_info(struct device *dev, u32 *length, u32 *type)
 	return vtd;
 }
 
+/*
+ * Set dirty tracking for the device list of a domain. The caller must
+ * hold the domain->lock when calling it.
+ */
+static int device_set_dirty_tracking(struct list_head *devices, bool enable)
+{
+	struct device_domain_info *info;
+	int ret = 0;
+
+	list_for_each_entry(info, devices, link) {
+		ret = intel_pasid_setup_dirty_tracking(info->iommu, info->dev,
+						       IOMMU_NO_PASID, enable);
+		if (ret)
+			break;
+	}
+
+	return ret;
+}
+
+static int parent_domain_set_dirty_tracking(struct dmar_domain *domain,
+					    bool enable)
+{
+	struct dmar_domain *s1_domain;
+	unsigned long flags;
+	int ret;
+
+	spin_lock(&domain->s1_lock);
+	list_for_each_entry(s1_domain, &domain->s1_domains, s2_link) {
+		spin_lock_irqsave(&s1_domain->lock, flags);
+		ret = device_set_dirty_tracking(&s1_domain->devices, enable);
+		spin_unlock_irqrestore(&s1_domain->lock, flags);
+		if (ret)
+			goto err_unwind;
+	}
+	spin_unlock(&domain->s1_lock);
+	return 0;
+
+err_unwind:
+	list_for_each_entry(s1_domain, &domain->s1_domains, s2_link) {
+		spin_lock_irqsave(&s1_domain->lock, flags);
+		device_set_dirty_tracking(&s1_domain->devices,
+					  domain->dirty_tracking);
+		spin_unlock_irqrestore(&s1_domain->lock, flags);
+	}
+	spin_unlock(&domain->s1_lock);
+	return ret;
+}
+
 static int intel_iommu_set_dirty_tracking(struct iommu_domain *domain,
 					  bool enable)
 {
 	struct dmar_domain *dmar_domain = to_dmar_domain(domain);
-	struct device_domain_info *info;
 	int ret;
 
 	spin_lock(&dmar_domain->lock);
 	if (dmar_domain->dirty_tracking == enable)
 		goto out_unlock;
 
-	list_for_each_entry(info, &dmar_domain->devices, link) {
-		ret = intel_pasid_setup_dirty_tracking(info->iommu,
-						       info->domain, info->dev,
-						       IOMMU_NO_PASID, enable);
+	ret = device_set_dirty_tracking(&dmar_domain->devices, enable);
+	if (ret)
+		goto err_unwind;
+
+	if (dmar_domain->nested_parent) {
+		ret = parent_domain_set_dirty_tracking(dmar_domain, enable);
 		if (ret)
 			goto err_unwind;
 	}
@@ -4953,10 +5070,8 @@ out_unlock:
 	return 0;
 
 err_unwind:
-	list_for_each_entry(info, &dmar_domain->devices, link)
-		intel_pasid_setup_dirty_tracking(info->iommu, dmar_domain,
-						 info->dev, IOMMU_NO_PASID,
-						 dmar_domain->dirty_tracking);
+	device_set_dirty_tracking(&dmar_domain->devices,
+				  dmar_domain->dirty_tracking);
 	spin_unlock(&dmar_domain->lock);
 	return ret;
 }
