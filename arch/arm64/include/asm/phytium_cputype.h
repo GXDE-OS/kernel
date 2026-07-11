@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * Copyright (C) 2025, Phytium Technology Co., Ltd.
+ * Copyright (C) 2025,Phytium Technology Co.,Ltd.
  */
 #ifndef __ASM_PHYTIUM_CPUTYPE_H
 #define __ASM_PHYTIUM_CPUTYPE_H

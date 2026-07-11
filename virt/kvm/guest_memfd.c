@@ -304,9 +304,7 @@ static int kvm_gmem_error_page(struct address_space *mapping, struct page *page)
 
 static const struct address_space_operations kvm_gmem_aops = {
 	.dirty_folio = noop_dirty_folio,
-#ifdef CONFIG_MIGRATION
 	.migrate_folio	= kvm_gmem_migrate_folio,
-#endif
 	.error_remove_page = kvm_gmem_error_page,
 };
 
@@ -401,15 +399,16 @@ int kvm_gmem_create(struct kvm *kvm, struct kvm_create_guest_memfd *args)
 }
 
 int kvm_gmem_bind(struct kvm *kvm, struct kvm_memory_slot *slot,
-		  unsigned int fd, loff_t offset)
+		  unsigned int fd, uoff_t offset)
 {
-	loff_t size = slot->npages << PAGE_SHIFT;
+	uoff_t size = slot->npages << PAGE_SHIFT;
 	unsigned long start, end;
 	struct kvm_gmem *gmem;
 	struct inode *inode;
 	struct file *file;
 	int r = -EINVAL;
 
+	BUILD_BUG_ON(sizeof(gpa_t) != sizeof(offset));
 	BUILD_BUG_ON(sizeof(gfn_t) != sizeof(slot->gmem.pgoff));
 
 	file = fget(fd);
@@ -425,8 +424,7 @@ int kvm_gmem_bind(struct kvm *kvm, struct kvm_memory_slot *slot,
 
 	inode = file_inode(file);
 
-	if (offset < 0 || !PAGE_ALIGNED(offset) ||
-	    offset + size > i_size_read(inode))
+	if (!PAGE_ALIGNED(offset) || offset + size > i_size_read(inode))
 		goto err;
 
 	filemap_invalidate_lock(inode->i_mapping);
@@ -516,8 +514,10 @@ int kvm_gmem_get_pfn(struct kvm *kvm, struct kvm_memory_slot *slot,
 	}
 
 	if (folio_test_hwpoison(folio)) {
+		folio_unlock(folio);
+		folio_put(folio);
 		r = -EHWPOISON;
-		goto out_unlock;
+		goto out_fput;
 	}
 
 	page = folio_file_page(folio, index);
@@ -528,7 +528,6 @@ int kvm_gmem_get_pfn(struct kvm *kvm, struct kvm_memory_slot *slot,
 
 	r = 0;
 
-out_unlock:
 	folio_unlock(folio);
 out_fput:
 	fput(file);
