@@ -87,7 +87,6 @@ void acpi_remove_early_pio(void)
 	}
 }
 
-
 #ifdef CONFIG_SMP
 static int set_processor_mask(u32 id, u32 pass)
 {
