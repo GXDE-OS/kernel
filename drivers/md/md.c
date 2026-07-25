@@ -9239,54 +9239,61 @@ void md_do_sync(struct md_thread *thread)
 }
 EXPORT_SYMBOL_GPL(md_do_sync);
 
+static bool rdev_removeable(struct md_rdev *rdev)
+{
+	/* rdev is not used. */
+	if (rdev->raid_disk < 0)
+		return false;
+
+	/* There are still inflight io, don't remove this rdev. */
+	if (atomic_read(&rdev->nr_pending))
+		return false;
+
+	/*
+	 * An error occurred but has not yet been acknowledged by the metadata
+	 * handler, don't remove this rdev.
+	 */
+	if (test_bit(Blocked, &rdev->flags))
+		return false;
+
+	/* Fautly rdev is not used, it's safe to remove it. */
+	if (test_bit(Faulty, &rdev->flags))
+		return true;
+
+	/* Journal disk can only be removed if it's faulty. */
+	if (test_bit(Journal, &rdev->flags))
+		return false;
+
+	/*
+	 * 'In_sync' is cleared while 'raid_disk' is valid, which means
+	 * replacement has just become active from pers->spare_active(), and
+	 * then pers->hot_remove_disk() will replace this rdev with replacement.
+	 */
+	if (!test_bit(In_sync, &rdev->flags))
+		return true;
+
+	return false;
+}
+
 static int remove_and_add_spares(struct mddev *mddev,
 				 struct md_rdev *this)
 {
 	struct md_rdev *rdev;
 	int spares = 0;
 	int removed = 0;
-	bool remove_some = false;
 
 	if (this && test_bit(MD_RECOVERY_RUNNING, &mddev->recovery))
 		/* Mustn't remove devices when resync thread is running */
 		return 0;
 
 	rdev_for_each(rdev, mddev) {
-		if ((this == NULL || rdev == this) &&
-		    rdev->raid_disk >= 0 &&
-		    !test_bit(Blocked, &rdev->flags) &&
-		    test_bit(Faulty, &rdev->flags) &&
-		    atomic_read(&rdev->nr_pending)==0) {
-			/* Faulty non-Blocked devices with nr_pending == 0
-			 * never get nr_pending incremented,
-			 * never get Faulty cleared, and never get Blocked set.
-			 * So we can synchronize_rcu now rather than once per device
-			 */
-			remove_some = true;
-			set_bit(RemoveSynchronized, &rdev->flags);
+		if ((this == NULL || rdev == this) && rdev_removeable(rdev) &&
+		    !mddev->pers->hot_remove_disk(mddev, rdev)) {
+			sysfs_unlink_rdev(mddev, rdev);
+			rdev->saved_raid_disk = rdev->raid_disk;
+			rdev->raid_disk = -1;
+			removed++;
 		}
-	}
-
-	if (remove_some)
-		synchronize_rcu();
-	rdev_for_each(rdev, mddev) {
-		if ((this == NULL || rdev == this) &&
-		    rdev->raid_disk >= 0 &&
-		    !test_bit(Blocked, &rdev->flags) &&
-		    ((test_bit(RemoveSynchronized, &rdev->flags) ||
-		     (!test_bit(In_sync, &rdev->flags) &&
-		      !test_bit(Journal, &rdev->flags))) &&
-		    atomic_read(&rdev->nr_pending)==0)) {
-			if (mddev->pers->hot_remove_disk(
-				    mddev, rdev) == 0) {
-				sysfs_unlink_rdev(mddev, rdev);
-				rdev->saved_raid_disk = rdev->raid_disk;
-				rdev->raid_disk = -1;
-				removed++;
-			}
-		}
-		if (remove_some && test_bit(RemoveSynchronized, &rdev->flags))
-			clear_bit(RemoveSynchronized, &rdev->flags);
 	}
 
 	if (removed && mddev->kobj.sd)
