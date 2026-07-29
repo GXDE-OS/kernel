@@ -62,6 +62,7 @@
  */
 
 #include <linux/bits.h>
+#include <linux/hid.h>
 #include <linux/kernel.h>
 #include <linux/input.h>
 #include <linux/rcupdate.h>
@@ -106,7 +107,7 @@
 #define PKT_XBE2_FW_5_11    4
 
 #define FLAG_DELAY_INIT BIT(0)
-#define FLAG_FORCE_INIT BIT(1)
+#define FLAG_READ_XUSB10 BIT(1)
 
 static bool dpad_to_buttons;
 module_param(dpad_to_buttons, bool, S_IRUGO);
@@ -367,36 +368,36 @@ static const struct xpad_device {
 	{ 0x1bad, 0xfd00, "Razer Onza TE", 0, XTYPE_XBOX360 },
 	{ 0x1bad, 0xfd01, "Razer Onza", 0, XTYPE_XBOX360 },
 	{ 0x1ee9, 0x1590, "ZOTAC Gaming Zone", 0, XTYPE_XBOX360 },
-    { 0x20bc, 0x5125, "Beitong KP20A/KP40A Controller", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-    { 0x20bc, 0x5126, "Beitong KP20A Controller", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-    { 0x20bc, 0x5127, "Beitong KP20A/KP40A Controller", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-    { 0x20bc, 0x5128, "Beitong KP20A Controller", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-    { 0x20bc, 0x512f, "Beitong KP70A Controller", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-    { 0x20bc, 0x5130, "Beitong KP70A Controller", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-    { 0x20bc, 0x5133, "Beitong KP50B Controller", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-    { 0x20bc, 0x5134, "Beitong KP50B Controller", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-    { 0x20bc, 0x5145, "Beitong KP40A/KP40B Controller", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-    { 0x20bc, 0x5146, "Beitong KP40A/KP40B Controller", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-    { 0x20bc, 0x5149, "Beitong KP50C Controller", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-    { 0x20bc, 0x514a, "Beitong KP50C Controller", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-    { 0x20bc, 0x5150, "Beitong KP50D Controller", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-    { 0x20bc, 0x5151, "Beitong KP50D Controller", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-    { 0x20bc, 0x5152, "Beitong KP50E Controller", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-    { 0x20bc, 0x5153, "Beitong KP50E Controller", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-    { 0x20bc, 0x5154, "Beitong KP40D Controller", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-    { 0x20bc, 0x5155, "Beitong KP40D Controller", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-    { 0x20bc, 0x5158, "Beitong KP20D Controller", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-    { 0x20bc, 0x5159, "Beitong KP20D Controller", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-    { 0x20bc, 0x515b, "Beitong KP40D Controller (White)", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-    { 0x20bc, 0x515c, "Beitong KP40D Controller (White)", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-    { 0x20bc, 0x515d, "Beitong KP40F Controller (White)", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-    { 0x20bc, 0x515e, "Beitong KP40F Controller (White)", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-    { 0x20bc, 0x515f, "Beitong KP70A Controller", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-    { 0x20bc, 0x5160, "Beitong KP70A Controller", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-    { 0x20bc, 0x5169, "Beitong KP40F Controller (Black)", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-    { 0x20bc, 0x516a, "Beitong KP40F Controller (Black)", 0, XTYPE_XBOX360, FLAG_FORCE_INIT },
-	{ 0x20bc, 0x5134, "BETOP BTP-KP50B Xinput Dongle", 0, XTYPE_XBOX360 },
-	{ 0x20bc, 0x514a, "BETOP BTP-KP50C Xinput Dongle", 0, XTYPE_XBOX360 },
+	{ 0x20bc, 0x5125, "BEITONG BTP-KP20A/BTP-KP40A Controller", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
+	{ 0x20bc, 0x5126, "BEITONG BTP-KP20A Controller", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
+	{ 0x20bc, 0x5127, "BEITONG BTP-KP20A/BTP-KP40A Controller", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
+	{ 0x20bc, 0x5128, "BEITONG BTP-KP20A Controller", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
+	{ 0x20bc, 0x512f, "BEITONG BTP-KP70A Controller", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
+	{ 0x20bc, 0x5130, "BEITONG BTP-KP70A Controller", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
+	{ 0x20bc, 0x5133, "BEITONG BTP-KP50B Controller", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
+ 	{ 0x20bc, 0x5134, "BETOP BTP-KP50B Xinput Dongle", 0, XTYPE_XBOX360 },
+	{ 0x20bc, 0x5145, "BEITONG BTP-KP40A/BTP-KP40B Controller", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
+	{ 0x20bc, 0x5146, "BEITONG BTP-KP40A/BTP-KP40B Controller", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
+	{ 0x20bc, 0x5149, "BEITONG BTP-KP50C Controller", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
+ 	{ 0x20bc, 0x514a, "BETOP BTP-KP50C Xinput Dongle", 0, XTYPE_XBOX360 },
+	{ 0x20bc, 0x5150, "BEITONG BTP-KP50D Controller", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
+	{ 0x20bc, 0x5151, "BEITONG BTP-KP50D Controller", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
+	{ 0x20bc, 0x5152, "BEITONG BTP-KP50E Controller", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
+	{ 0x20bc, 0x5153, "BEITONG BTP-KP50E Controller", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
+	{ 0x20bc, 0x5154, "BEITONG BTP-KP40D Controller", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
+	{ 0x20bc, 0x5155, "BEITONG BTP-KP40D Controller", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
+	{ 0x20bc, 0x5158, "BEITONG BTP-KP20D Controller", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
+	{ 0x20bc, 0x5159, "BEITONG BTP-KP20D Controller", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
+	{ 0x20bc, 0x515b, "BEITONG BTP-KP40D Controller (White)", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
+	{ 0x20bc, 0x515c, "BEITONG BTP-KP40D Controller (White)", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
+	{ 0x20bc, 0x515d, "BEITONG BTP-KP40F Controller (White)", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
+	{ 0x20bc, 0x515e, "BEITONG BTP-KP40F Controller (White)", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
+	{ 0x20bc, 0x515f, "BEITONG BTP-KP70A Controller", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
+	{ 0x20bc, 0x5160, "BEITONG BTP-KP70A Controller", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
+	{ 0x20bc, 0x5169, "BEITONG BTP-KP40F Controller (Black)", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
+	{ 0x20bc, 0x516a, "BEITONG BTP-KP40F Controller (Black)", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
+	{ 0x20bc, 0x518a, "BEITONG BTP-KP70C NTE Edition Controller", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
+	{ 0x20bc, 0x518b, "BEITONG BTP-KP70C NTE Edition Wireless Controller", 0, XTYPE_XBOX360, FLAG_READ_XUSB10 },
 	{ 0x20d6, 0x2001, "BDA Xbox Series X Wired Controller", 0, XTYPE_XBOXONE },
 	{ 0x20d6, 0x2009, "PowerA Enhanced Wired Controller for Xbox Series X|S", 0, XTYPE_XBOXONE },
 	{ 0x20d6, 0x2064, "PowerA Wired Controller for Xbox", MAP_SHARE_BUTTON, XTYPE_XBOXONE },
@@ -788,10 +789,10 @@ static const struct xboxone_init_packet xboxone_init_packets[] = {
 	XBOXONE_INIT_PKT(0x045e, 0x0b00, extra_input_packet_init),
 	XBOXONE_INIT_PKT(0x0000, 0x0000, xboxone_led_on),
 	XBOXONE_INIT_PKT(0x0000, 0x0000, xboxone_auth_done),
-    XBOXONE_INIT_PKT(0x20bc, 0x0000, btp_ack_probe_packet),
-    XBOXONE_INIT_PKT(0x20bc, 0x0000, btp_probe_response_packet),
-    XBOXONE_INIT_PKT(0x20bc, 0x0000, btp_ack_probe_packet),
-    XBOXONE_INIT_PKT(0x20bc, 0x0000, btp_ack_probe_packet),
+	XBOXONE_INIT_PKT(0x20bc, 0x0000, btp_ack_probe_packet),
+	XBOXONE_INIT_PKT(0x20bc, 0x0000, btp_probe_response_packet),
+	XBOXONE_INIT_PKT(0x20bc, 0x0000, btp_ack_probe_packet),
+	XBOXONE_INIT_PKT(0x20bc, 0x0000, btp_ack_probe_packet),
 	XBOXONE_INIT_PKT(0x24c6, 0x541a, xboxone_rumblebegin_init),
 	XBOXONE_INIT_PKT(0x24c6, 0x542a, xboxone_rumblebegin_init),
 	XBOXONE_INIT_PKT(0x24c6, 0x543a, xboxone_rumblebegin_init),
@@ -853,7 +854,7 @@ struct usb_xpad {
 	time64_t mode_btn_down_ts;
 	bool delay_init;		/* init packets should be delayed */
 	bool delayed_init_done;
-    bool force_init;                /* send init packets even if it is not a xbox one device */
+	bool read_xusb10;		/* read XUSB10 descriptor during probe */
 };
 
 static int xpad_init_input(struct usb_xpad *xpad);
@@ -1329,7 +1330,7 @@ static bool xpad_prepare_next_init_packet(struct usb_xpad *xpad)
 {
 	const struct xboxone_init_packet *init_packet;
 
-	if (xpad->xtype != XTYPE_XBOXONE && !xpad->force_init)
+	if (xpad->xtype != XTYPE_XBOXONE && !xpad->read_xusb10)
 		return false;
 
 	/*
@@ -1868,14 +1869,14 @@ static int xpad_start_input(struct usb_xpad *xpad)
 		 */
 		u8 dummy[20];
 
-        /*
-         * Some third-party Xbox 360-style controllers
-         * require sending Xbox One messages to finish initialization.
-         */
-        {
-            guard(spinlock_irqsave)(&xpad->odata_lock);
-            xpad_prepare_next_init_packet(xpad);
-        }
+	    /*
+	     * Some third-party Xbox 360-style controllers
+	     * require sending Xbox One messages to finish initialization.
+	     */
+	    {
+	        guard(spinlock_irqsave)(&xpad->odata_lock);
+	        xpad_prepare_next_init_packet(xpad);
+	    }
 
 		error = usb_control_msg_recv(xpad->udev, 0,
 					     /* bRequest */ 0x01,
@@ -2129,6 +2130,7 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 	struct usb_device *udev = interface_to_usbdev(intf);
 	struct usb_xpad *xpad;
 	struct usb_endpoint_descriptor *ep_irq_in, *ep_irq_out;
+	u8 ms_feature_descriptor[40];
 	int i, error;
 
 	if (intf->cur_altsetting->desc.bNumEndpoints != 2)
@@ -2167,8 +2169,8 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 	xpad->name = xpad_device[i].name;
 	if (xpad_device[i].flags & FLAG_DELAY_INIT)
 		xpad->delay_init = true;
-    if (xpad_device[i].flags & FLAG_FORCE_INIT)
-		xpad->force_init = true;
+	if (xpad_device[i].flags & FLAG_READ_XUSB10)
+		xpad->read_xusb10 = true;
 
 	xpad->packet_type = PKT_XB;
 	INIT_WORK(&xpad->work, xpad_presence_work);
@@ -2233,6 +2235,19 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 			 xpad, ep_irq_in->bInterval);
 	xpad->irq_in->transfer_dma = xpad->idata_dma;
 	xpad->irq_in->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+	if (xpad->read_xusb10) {
+		error = usb_control_msg_recv(udev, 0, 0xee,
+					     USB_TYPE_VENDOR | USB_DIR_IN |
+						USB_RECIP_DEVICE,
+					     0x0000, 0x0004,
+					     ms_feature_descriptor,
+					     sizeof(ms_feature_descriptor), 25,
+					     GFP_KERNEL);
+		if (error)
+			dev_warn(&intf->dev,
+				 "unable to read Microsoft feature descriptor: %d\n",
+				 error);
+	}
 
 	usb_set_intfdata(intf, xpad);
 
@@ -2399,7 +2414,79 @@ static struct usb_driver xpad_driver = {
 	.id_table	= xpad_table,
 };
 
-module_usb_driver(xpad_driver);
+#if IS_REACHABLE(CONFIG_HID)
+static int xpad_receiver_probe(struct hid_device *hdev, const struct hid_device_id *id)
+{
+	int error;
+
+	error = hid_parse(hdev);
+	if (error)
+		return error;
+
+	error = hid_hw_start(hdev, 0);
+	if (error)
+		return error;
+
+	error = hid_hw_open(hdev);
+	if (error) {
+		hid_hw_stop(hdev);
+		return error;
+	}
+
+	return 0;
+}
+
+static void xpad_receiver_remove(struct hid_device *hdev)
+{
+	hid_hw_close(hdev);
+	hid_hw_stop(hdev);
+}
+
+static const struct hid_device_id xpad_receiver_devices[] = {
+	{ HID_USB_DEVICE(0x20dd, 0x515c) },
+	{ }
+};
+MODULE_DEVICE_TABLE(hid, xpad_receiver_devices);
+
+static struct hid_driver xpad_receiver_driver = {
+	.name = "xpad-kp40d-receiver",
+	.id_table = xpad_receiver_devices,
+	.probe = xpad_receiver_probe,
+	.remove = xpad_receiver_remove,
+};
+#endif
+
+static int __init xpad_init(void)
+{
+	int error;
+
+#if IS_REACHABLE(CONFIG_HID)
+	error = hid_register_driver(&xpad_receiver_driver);
+	if (error)
+		return error;
+#endif
+
+	error = usb_register(&xpad_driver);
+	if (error) {
+#if IS_REACHABLE(CONFIG_HID)
+		hid_unregister_driver(&xpad_receiver_driver);
+#endif
+		return error;
+	}
+
+	return 0;
+}
+
+static void __exit xpad_exit(void)
+{
+	usb_deregister(&xpad_driver);
+#if IS_REACHABLE(CONFIG_HID)
+	hid_unregister_driver(&xpad_receiver_driver);
+#endif
+}
+
+module_init(xpad_init);
+module_exit(xpad_exit);
 
 MODULE_AUTHOR("Marko Friedemann <mfr@bmx-chemnitz.de>");
 MODULE_DESCRIPTION("Xbox pad driver");
