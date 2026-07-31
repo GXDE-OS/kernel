@@ -155,6 +155,7 @@ obj-$(CONFIG_CHR_DEV_SCH)	+= ch.o
 obj-$(CONFIG_SCSI_ENCLOSURE)	+= ses.o
 
 obj-$(CONFIG_SCSI_HISI_SAS) += hisi_sas/
+obj-$(CONFIG_VHBA)		+= vhba/
 
 obj-$(CONFIG_SCSI_LINKDATA_PS3STOR)	+= linkdata/
 
