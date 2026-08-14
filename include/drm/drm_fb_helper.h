@@ -256,8 +256,6 @@ int drm_fb_helper_check_var(struct fb_var_screeninfo *var,
 
 int drm_fb_helper_restore_fbdev_mode_unlocked(struct drm_fb_helper *fb_helper);
 
-struct fb_info *drm_fb_helper_alloc_info(struct drm_fb_helper *fb_helper);
-void drm_fb_helper_release_info(struct drm_fb_helper *fb_helper);
 void drm_fb_helper_unregister_info(struct drm_fb_helper *fb_helper);
 void drm_fb_helper_fill_info(struct fb_info *info,
 			     struct drm_fb_helper *fb_helper,
@@ -340,16 +338,6 @@ drm_fb_helper_restore_fbdev_mode_unlocked(struct drm_fb_helper *fb_helper)
 	return 0;
 }
 
-static inline struct fb_info *
-drm_fb_helper_alloc_info(struct drm_fb_helper *fb_helper)
-{
-	return NULL;
-}
-
-static inline void drm_fb_helper_release_info(struct drm_fb_helper *fb_helper)
-{
-}
-
 static inline void drm_fb_helper_unregister_info(struct drm_fb_helper *fb_helper)
 {
 }
@@ -414,5 +402,22 @@ static inline void drm_fb_helper_lastclose(struct drm_device *dev)
 {
 }
 #endif
+
+/*
+ * Compatibility helpers for the pre-v6.19 DRM fbdev helper API, so that
+ * out-of-tree modules written against the old interface keep building
+ * after fb_info allocation was moved into the fbdev helpers.
+ *
+ * The fb_info instance is now allocated by drm_fb_helper_initial_config()
+ * before the driver's fbdev_probe callback runs, hence
+ * drm_fb_helper_alloc_fbi() only has to return the already allocated
+ * instance.
+ */
+static inline struct fb_info *drm_fb_helper_alloc_fbi(struct drm_fb_helper *fb_helper)
+{
+	return fb_helper->info;
+}
+
+#define drm_fb_helper_unregister_fbi drm_fb_helper_unregister_info
 
 #endif
