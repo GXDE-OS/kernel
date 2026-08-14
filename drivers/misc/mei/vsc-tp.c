@@ -36,20 +36,24 @@
 #define VSC_TP_XFER_TIMEOUT_BYTES		700
 #define VSC_TP_PACKET_PADDING_SIZE		1
 #define VSC_TP_PACKET_SIZE(pkt) \
-	(sizeof(struct vsc_tp_packet) + le16_to_cpu((pkt)->len) + VSC_TP_CRC_SIZE)
+	(sizeof(struct vsc_tp_packet_hdr) + le16_to_cpu((pkt)->hdr.len) + VSC_TP_CRC_SIZE)
 #define VSC_TP_MAX_PACKET_SIZE \
-	(sizeof(struct vsc_tp_packet) + VSC_TP_MAX_MSG_SIZE + VSC_TP_CRC_SIZE)
+	(sizeof(struct vsc_tp_packet_hdr) + VSC_TP_MAX_MSG_SIZE + VSC_TP_CRC_SIZE)
 #define VSC_TP_MAX_XFER_SIZE \
 	(VSC_TP_MAX_PACKET_SIZE + VSC_TP_XFER_TIMEOUT_BYTES)
 #define VSC_TP_NEXT_XFER_LEN(len, offset) \
-	(len + sizeof(struct vsc_tp_packet) + VSC_TP_CRC_SIZE - offset + VSC_TP_PACKET_PADDING_SIZE)
+	(len + sizeof(struct vsc_tp_packet_hdr) + VSC_TP_CRC_SIZE - offset + VSC_TP_PACKET_PADDING_SIZE)
 
-struct vsc_tp_packet {
+struct vsc_tp_packet_hdr {
 	__u8 sync;
 	__u8 cmd;
 	__le16 len;
 	__le32 seq;
-	__u8 buf[] __counted_by(len);
+};
+
+struct vsc_tp_packet {
+	struct vsc_tp_packet_hdr hdr;
+	__u8 buf[VSC_TP_MAX_XFER_SIZE - sizeof(struct vsc_tp_packet_hdr)];
 };
 
 struct vsc_tp {
@@ -158,12 +162,12 @@ static int vsc_tp_dev_xfer(struct vsc_tp *tp, void *obuf, void *ibuf, size_t len
 static int vsc_tp_xfer_helper(struct vsc_tp *tp, struct vsc_tp_packet *pkt,
 			      void *ibuf, u16 ilen)
 {
-	int ret, offset = 0, cpy_len, src_len, dst_len = sizeof(struct vsc_tp_packet);
+	int ret, offset = 0, cpy_len, src_len, dst_len = sizeof(struct vsc_tp_packet_hdr);
 	int next_xfer_len = VSC_TP_PACKET_SIZE(pkt) + VSC_TP_XFER_TIMEOUT_BYTES;
 	u8 *src, *crc_src, *rx_buf = tp->rx_buf;
 	int count_down = VSC_TP_MAX_XFER_COUNT;
 	u32 recv_crc = 0, crc = ~0;
-	struct vsc_tp_packet ack;
+	struct vsc_tp_packet_hdr ack;
 	u8 *dst = (u8 *)&ack;
 	bool synced = false;
 
@@ -280,10 +284,10 @@ int vsc_tp_xfer(struct vsc_tp *tp, u8 cmd, const void *obuf, size_t olen,
 
 	guard(mutex)(&tp->mutex);
 
-	pkt->sync = VSC_TP_PACKET_SYNC;
-	pkt->cmd = cmd;
-	pkt->len = cpu_to_le16(olen);
-	pkt->seq = cpu_to_le32(++tp->seq);
+	pkt->hdr.sync = VSC_TP_PACKET_SYNC;
+	pkt->hdr.cmd = cmd;
+	pkt->hdr.len = cpu_to_le16(olen);
+	pkt->hdr.seq = cpu_to_le32(++tp->seq);
 	memcpy(pkt->buf, obuf, olen);
 
 	crc = ~crc32(~0, (u8 *)pkt, sizeof(pkt) + olen);
@@ -331,12 +335,12 @@ int vsc_tp_rom_xfer(struct vsc_tp *tp, const void *obuf, void *ibuf, size_t len)
 		return ret;
 	}
 
-	ret = vsc_tp_dev_xfer(tp, tp->tx_buf, tp->rx_buf, len);
+	ret = vsc_tp_dev_xfer(tp, tp->tx_buf, ibuf ? tp->rx_buf : NULL, len);
 	if (ret)
 		return ret;
 
 	if (ibuf)
-		cpu_to_be32_array(ibuf, tp->rx_buf, words);
+		be32_to_cpu_array(ibuf, tp->rx_buf, words);
 
 	return ret;
 }
@@ -568,6 +572,19 @@ static void vsc_tp_remove(struct spi_device *spi)
 	free_irq(spi->irq, tp);
 }
 
+static void vsc_tp_shutdown(struct spi_device *spi)
+{
+	struct vsc_tp *tp = spi_get_drvdata(spi);
+
+	platform_device_unregister(tp->pdev);
+
+	mutex_destroy(&tp->mutex);
+
+	vsc_tp_reset(tp);
+
+	free_irq(spi->irq, tp);
+}
+
 static const struct acpi_device_id vsc_tp_acpi_ids[] = {
 	{ "INTC1009" }, /* Raptor Lake */
 	{ "INTC1058" }, /* Tiger Lake */
@@ -580,6 +597,7 @@ MODULE_DEVICE_TABLE(acpi, vsc_tp_acpi_ids);
 static struct spi_driver vsc_tp_driver = {
 	.probe = vsc_tp_probe,
 	.remove = vsc_tp_remove,
+	.shutdown = vsc_tp_shutdown,
 	.driver = {
 		.name = "vsc-tp",
 		.acpi_match_table = vsc_tp_acpi_ids,
