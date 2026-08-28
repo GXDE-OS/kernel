@@ -404,7 +404,7 @@ static int phytium_lbc_probe(struct platform_device *pdev)
 	int ret;
 	int i;
 	struct resource *res;
-	const char **reg_names_array;
+	const char *reg_names_array[4] = {0};
 
 	lbc = devm_kzalloc(dev, sizeof(struct phytium_lbc), GFP_KERNEL);
 	if (!lbc)
@@ -416,45 +416,46 @@ static int phytium_lbc_probe(struct platform_device *pdev)
 
 	if (!lbc->dev_num || lbc->dev_num > PHYTIUM_MAX_SRAM_BLOCK) {
 		dev_err(dev, "no device deceted, or device number is too large\n");
-		kfree(lbc);
 		return -ENODEV;
 	}
 	dev_num = 0;
-	reg_names_array = kcalloc(4, sizeof(*reg_names_array), GFP_KERNEL);
 	if (dev->of_node) {
 		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "localbus");
 		lbc->io_base = devm_ioremap_resource(dev, res);
 		if (IS_ERR(lbc->io_base)) {
 			ret = PTR_ERR(lbc->io_base);
-			kfree(lbc);
 			return ret;
 		}
 		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "lbc_mm");
 		lbc->mm_base = devm_ioremap_resource(dev, res);
 		if (IS_ERR(lbc->mm_base)) {
 			ret = PTR_ERR(lbc->mm_base);
-			kfree(lbc);
 			return ret;
 		}
 	} else if (has_acpi_companion(dev)) {
 		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+		if (!res)
+			return -ENODEV;
 		fwnode_property_read_string_array(dev->fwnode, "reg-names", reg_names_array, 2);
 		res->name = reg_names_array[0];
 		lbc->io_base = devm_ioremap_resource(dev, res);
 		if (IS_ERR(lbc->io_base)) {
 			ret = PTR_ERR(lbc->io_base);
-			kfree(lbc);
 			return ret;
 		}
 
 		res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+		if (!res)
+			return -ENODEV;
 		res->name = reg_names_array[1];
 		lbc->mm_base = devm_ioremap_resource(dev, res);
 		if (IS_ERR(lbc->mm_base)) {
 			ret = PTR_ERR(lbc->mm_base);
-			kfree(lbc);
 			return ret;
 		}
+	} else {
+		dev_err(dev, "no device tree node or ACPI companion found.\n");
+		return -ENODEV;
 	}
 
 	lbc->mm_size = resource_size(res);
