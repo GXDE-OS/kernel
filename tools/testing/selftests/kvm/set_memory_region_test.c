@@ -326,6 +326,57 @@ static void test_zero_memory_regions(void)
 }
 #endif /* __x86_64__ */
 
+static void test_invalid_memory_region_flags(void)
+{
+	uint32_t supported_flags = KVM_MEM_LOG_DIRTY_PAGES;
+	const uint32_t v2_only_flags = KVM_MEM_GUEST_MEMFD;
+	struct kvm_vm *vm;
+	int r, i;
+
+#ifdef __x86_64__
+	supported_flags |= KVM_MEM_READONLY;
+
+	if (kvm_check_cap(KVM_CAP_VM_TYPES) & BIT(KVM_X86_SW_PROTECTED_VM))
+		vm = vm_create_barebones_protected_vm();
+	else
+#endif
+		vm = vm_create_barebones();
+
+	if (kvm_check_cap(KVM_CAP_MEMORY_ATTRIBUTES) & KVM_MEMORY_ATTRIBUTE_PRIVATE)
+		supported_flags |= KVM_MEM_GUEST_MEMFD;
+
+	for (i = 0; i < 32; i++) {
+		if ((supported_flags & BIT(i)) && !(v2_only_flags & BIT(i)))
+			continue;
+
+		r = __vm_set_user_memory_region(vm, 0, BIT(i),
+						0, MEM_REGION_SIZE, NULL);
+
+		TEST_ASSERT(r && errno == EINVAL,
+			    "KVM_SET_USER_MEMORY_REGION should have failed on v2 only flag 0x%lx", BIT(i));
+
+		if (supported_flags & BIT(i))
+			continue;
+
+		r = __vm_set_user_memory_region2(vm, 0, BIT(i),
+						 0, MEM_REGION_SIZE, NULL, 0, 0);
+		TEST_ASSERT(r && errno == EINVAL,
+			    "KVM_SET_USER_MEMORY_REGION2 should have failed on unsupported flag 0x%lx", BIT(i));
+	}
+
+	if (supported_flags & KVM_MEM_GUEST_MEMFD) {
+		int guest_memfd = vm_create_guest_memfd(vm, MEM_REGION_SIZE, 0);
+
+		r = __vm_set_user_memory_region2(vm, 0,
+						 KVM_MEM_LOG_DIRTY_PAGES | KVM_MEM_GUEST_MEMFD,
+						 0, MEM_REGION_SIZE, NULL, guest_memfd, 0);
+		TEST_ASSERT(r && errno == EINVAL,
+			    "KVM_SET_USER_MEMORY_REGION2 should have failed, dirty logging private memory is unsupported");
+
+		close(guest_memfd);
+	}
+}
+
 /*
  * Test it can be added memory slots up to KVM_CAP_NR_MEMSLOTS, then any
  * tentative to add further slots should fail.
@@ -442,7 +493,7 @@ static void test_add_overlapping_private_memory_regions(void)
 
 	vm = vm_create_barebones_protected_vm();
 
-	memfd = vm_create_guest_memfd(vm, MEM_REGION_SIZE * 4, 0);
+	memfd = vm_create_guest_memfd(vm, MEM_REGION_SIZE * 5, 0);
 
 	vm_set_user_memory_region2(vm, MEM_REGION_SLOT, KVM_MEM_GUEST_MEMFD,
 				   MEM_REGION_GPA, MEM_REGION_SIZE * 2, 0, memfd, 0);
@@ -458,7 +509,30 @@ static void test_add_overlapping_private_memory_regions(void)
 	vm_set_user_memory_region2(vm, MEM_REGION_SLOT, KVM_MEM_GUEST_MEMFD,
 				   MEM_REGION_GPA, 0, NULL, -1, 0);
 
-	/* Overlap the front half of the other slot. */
+	/*
+	 * Verify that overlap in the guest_memfd bindings (i.e. in guest_memfd
+	 * file offsets), but _not_ in the GPA space, fails with -EEXIST.
+	 */
+	r = __vm_set_user_memory_region2(vm, MEM_REGION_SLOT, KVM_MEM_GUEST_MEMFD,
+					 MEM_REGION_GPA,
+					 MEM_REGION_SIZE * 2,
+					 0, memfd, MEM_REGION_SIZE);
+	TEST_ASSERT(r == -1 && errno == EEXIST,
+		    "Overlapping guest_memfd() bindings should fail with EEXIST");
+
+	/* And now the back half of the other slot's guest_memfd binding. */
+	r = __vm_set_user_memory_region2(vm, MEM_REGION_SLOT, KVM_MEM_GUEST_MEMFD,
+					 MEM_REGION_GPA,
+					 MEM_REGION_SIZE * 2,
+					 0, memfd, MEM_REGION_SIZE * 3);
+	TEST_ASSERT(r == -1 && errno == EEXIST,
+		    "Overlapping guest_memfd() bindings should fail with EEXIST");
+
+	/*
+	 * Repeat the overlap tests, but this time with overlap in the memslots
+	 * GPA space.  Regardless of where there is overlap, KVM should return
+	 * -EEXIST.
+	 */
 	r = __vm_set_user_memory_region2(vm, MEM_REGION_SLOT, KVM_MEM_GUEST_MEMFD,
 					 MEM_REGION_GPA * 2 - MEM_REGION_SIZE,
 					 MEM_REGION_SIZE * 2,
@@ -490,6 +564,8 @@ int main(int argc, char *argv[])
 	 */
 	test_zero_memory_regions();
 #endif
+
+	test_invalid_memory_region_flags();
 
 	test_add_max_memory_regions();
 
