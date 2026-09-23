@@ -917,8 +917,8 @@ static int usbatm_atm_init(struct usbatm_data *instance)
 
 	instance->atm_dev = atm_dev;
 
-	atm_dev->ci_range.vpi_bits = ATM_CI_MAX;
-	atm_dev->ci_range.vci_bits = ATM_CI_MAX;
+	atm_dev->ci_range.vpi_bits = 8;
+	atm_dev->ci_range.vci_bits = 16;
 	atm_dev->signal = ATM_PHY_SIG_UNKNOWN;
 
 	/* temp init ATM device, set to 128kbit */
@@ -1018,7 +1018,8 @@ int usbatm_usb_probe(struct usb_interface *intf, const struct usb_device_id *id,
 	size_t size;
 
 	/* instance init */
-	size = struct_size(instance, urbs, num_rcv_urbs + num_snd_urbs);
+	size = struct_size(instance, urbs,
+			   size_add(num_rcv_urbs, num_snd_urbs));
 	instance = kzalloc(size, GFP_KERNEL);
 	if (!instance)
 		return -ENOMEM;

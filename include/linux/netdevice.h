@@ -1327,6 +1327,9 @@ struct netdev_net_notifier {
  * int (*ndo_mdb_del)(struct net_device *dev, struct nlattr *tb[],
  *		      struct netlink_ext_ack *extack);
  *	Deletes the MDB entry from dev.
+ * int (*ndo_mdb_del_bulk)(struct net_device *dev, struct nlattr *tb[],
+ *			   struct netlink_ext_ack *extack);
+ *	Bulk deletes MDB entries from dev.
  * int (*ndo_mdb_dump)(struct net_device *dev, struct sk_buff *skb,
  *		       struct netlink_callback *cb);
  *	Dumps MDB entries from dev. The first argument (marker) in the netlink
@@ -1611,9 +1614,16 @@ struct net_device_ops {
 	int			(*ndo_mdb_del)(struct net_device *dev,
 					       struct nlattr *tb[],
 					       struct netlink_ext_ack *extack);
+	int			(*ndo_mdb_del_bulk)(struct net_device *dev,
+						    struct nlattr *tb[],
+						    struct netlink_ext_ack *extack);
 	int			(*ndo_mdb_dump)(struct net_device *dev,
 						struct sk_buff *skb,
 						struct netlink_callback *cb);
+	int			(*ndo_mdb_get)(struct net_device *dev,
+					       struct nlattr *tb[], u32 portid,
+					       u32 seq,
+					       struct netlink_ext_ack *extack);
 	int			(*ndo_bridge_setlink)(struct net_device *dev,
 						      struct nlmsghdr *nlh,
 						      u16 flags,
@@ -2803,12 +2813,22 @@ struct pcpu_sw_netstats {
 } __aligned(4 * sizeof(u64));
 
 struct pcpu_dstats {
-	u64_stats_t		rx_packets;
-	u64_stats_t		rx_bytes;
-	u64_stats_t		tx_packets;
-	u64_stats_t		tx_bytes;
-	u64_stats_t		rx_drops;
-	u64_stats_t		tx_drops;
+	DEEPIN_KABI_BROKEN_REMOVE_BLOCK(
+		u64 rx_packets;
+		u64 rx_bytes;
+		u64 rx_drops;
+		u64 tx_packets;
+		u64 tx_bytes;
+		u64 tx_drops;
+	)
+	DEEPIN_KABI_BROKEN_INSERT_BLOCK(
+		u64_stats_t rx_packets;
+		u64_stats_t rx_bytes;
+		u64_stats_t tx_packets;
+		u64_stats_t tx_bytes;
+		u64_stats_t rx_drops;
+		u64_stats_t tx_drops;
+	)
 	struct u64_stats_sync	syncp;
 } __aligned(8 * sizeof(u64));
 

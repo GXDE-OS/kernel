@@ -124,9 +124,9 @@ static irqreturn_t spi_phyt_irq(int irq, void *dev_id)
 	struct spi_master *master = dev_id;
 	struct phytium_spi *fts = spi_master_get_devdata(master);
 
-	complete(&fts->cmd_completion);
 	writel_relaxed(0, fts->regfile + SPI_REGFILE_RV2AP_INTR_STATE);
 	writel_relaxed(0x10, fts->regfile + SPI_REGFILE_RV2AP_INT_CLEAN);
+	complete(&fts->cmd_completion);
 
 	return IRQ_HANDLED;
 }
@@ -158,7 +158,17 @@ static int spi_phyt_transfer_one(struct spi_master *master,
 			chip->tmode = TMOD_TO;
 	}
 
-	if (mem == nor->spimem && fts->tx && fts->len == 1) {
+	if (fts->tx && fts->rx) {
+		if (fts->half_duplex) {
+			dev_err(&master->dev, "SPI-V2 not support full duplex\n");
+			return -EPERM;
+		}
+		ret = spi_phytium_xfer(fts, spi->chip_select, transfer->bits_per_word,
+				spi->mode, chip->tmode, 0);
+		return ret;
+	}
+
+	if (mem != NULL && nor != NULL && mem == nor->spimem && fts->tx && fts->len == 1) {
 		if ((*(u8 *)fts->tx == SPINOR_OP_WREN) && fts->spi_write_flag == 0) {
 			spi_phytium_write_pre(fts, spi->chip_select,
 					transfer->bits_per_word, spi->mode,
@@ -423,8 +433,7 @@ void spi_handle_debug_err(struct phytium_spi *fts)
 			dev_info(dev, "(log)%.*s\n", SPI_LOG_LINE_MAX_LEN, &fts->log[0]);
 		}
 
-		for (i = 0; i < fts->log_size; i++)
-			fts->log[i] = 0;
+		memset(fts->log, 0, fts->log_size);
 	}
 
 	reg &= ~SPI_REGFILE_HAVE_LOG;
@@ -433,22 +442,29 @@ void spi_handle_debug_err(struct phytium_spi *fts)
 
 static void spi_phyt_hw_init(struct device *dev, struct phytium_spi *fts)
 {
-	u32 reg, i;
+	u32 reg, reg_ddr_high;
 
 	spi_phytium_default(fts);
 
 	reg = phytium_read_regfile(fts, SPI_REGFILE_DEBUG);
-	fts->ddr_paddr = ((reg & SPI_REGFILE_ADDR_MASK) >> 8) << SPI_DDR_ADDR_HIGH;
+
+	if (fts->regfile_version & SPI_REGFILE_VERSION_DDR) {
+		fts->ddr_paddr = ((reg & SPI_REGFILE_ADDR_MASK) >> 8);
+		reg_ddr_high = phytium_read_regfile(fts, SPI_REGFILE_DDR_HIGH_REG);
+		fts->ddr_paddr |= ((u64)reg_ddr_high << 20);
+	} else {
+		fts->ddr_paddr = ((reg & SPI_REGFILE_ADDR_MASK) >> 8) << SPI_DDR_ADDR_HIGH;
+	}
+
 	fts->log_size = ((reg & SPI_REGFILE_SIZE_MASK) >> 4) * SPI_DEBUG_LOG_SIZE;
-	fts->log = devm_ioremap(dev, fts->ddr_paddr, fts->log_size);
+	fts->log = devm_ioremap_wc(dev, fts->ddr_paddr, fts->log_size);
 
 	if (IS_ERR(fts->log)) {
 		dev_err(dev, "log_addr is err\n");
 		return;
 	}
 
-	for (i = 0; i < fts->log_size; i++)
-		fts->log[i] = 0;
+	memset(fts->log, 0, fts->log_size);
 }
 
 int spi_phyt_add_host(struct device *dev, struct phytium_spi *fts)
@@ -472,6 +488,7 @@ int spi_phyt_add_host(struct device *dev, struct phytium_spi *fts)
 		goto err_free_master;
 	}
 
+	master->use_gpio_descriptors = true;
 	master->mode_bits = SPI_CPOL | SPI_CPHA | SPI_LOOP;
 	master->bits_per_word_mask = SPI_BPW_MASK(8) | SPI_BPW_MASK(16);
 	master->bus_num = fts->bus_num;
@@ -485,7 +502,14 @@ int spi_phyt_add_host(struct device *dev, struct phytium_spi *fts)
 	master->dev.of_node = dev->of_node;
 	master->dev.fwnode = dev->fwnode;
 	master->flags = SPI_CONTROLLER_GPIO_SS;
-	master->flags |= SPI_CONTROLLER_HALF_DUPLEX;
+
+	fts->half_duplex = false;
+	if (!(phytium_read_regfile(fts, SPI_REGFILE_SOFTWARE2)
+				& SPI_REGFILE_FULL_DUPLEX)) {
+		dev_warn(dev, "SPI-V2 only support half duplex\n");
+		fts->half_duplex = true;
+		master->flags |= SPI_CONTROLLER_HALF_DUPLEX;
+	}
 
 	spi_master_set_devdata(master, fts);
 
@@ -531,6 +555,7 @@ int spi_phyt_suspend_host(struct phytium_spi *fts)
 {
 	int ret;
 
+	del_timer(&fts->timer);
 	ret = spi_controller_suspend(fts->master);
 	if (ret)
 		return ret;
@@ -544,6 +569,7 @@ int spi_phyt_resume_host(struct phytium_spi *fts)
 {
 	int ret;
 
+	mod_timer(&fts->timer, jiffies + msecs_to_jiffies(10));
 	spi_phyt_hw_init(&fts->master->dev, fts);
 
 	spi_phyt_enable_chip(fts, 0);
