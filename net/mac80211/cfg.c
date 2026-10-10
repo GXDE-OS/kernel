@@ -2648,7 +2648,11 @@ static int ieee80211_join_mesh(struct wiphy *wiphy, struct net_device *dev,
 	if (err)
 		return err;
 
-	return ieee80211_start_mesh(sdata);
+	err = ieee80211_start_mesh(sdata);
+	if (err)
+		ieee80211_link_release_channel(&sdata->deflink);
+
+	return err;
 }
 
 static int ieee80211_leave_mesh(struct wiphy *wiphy, struct net_device *dev)
@@ -2804,7 +2808,7 @@ static int ieee80211_set_txq_params(struct wiphy *wiphy,
 static int ieee80211_suspend(struct wiphy *wiphy,
 			     struct cfg80211_wowlan *wowlan)
 {
-	return __ieee80211_suspend(wiphy_priv(wiphy), wowlan);
+	return __ieee80211_suspend(wiphy_priv(wiphy), wowlan, false);
 }
 
 static int ieee80211_resume(struct wiphy *wiphy)
@@ -3351,6 +3355,9 @@ static int ieee80211_set_bitrate_mask(struct wiphy *wiphy,
 	int i, ret;
 
 	if (!ieee80211_sdata_running(sdata))
+		return -ENETDOWN;
+
+	if (!(sdata->flags & IEEE80211_SDATA_IN_DRIVER))
 		return -ENETDOWN;
 
 	/*
