@@ -20,6 +20,9 @@
 
 #include "cpu.h"
 
+#define MSR_HYGON_BP_CFG_IBRS_RAS_FLUSH_LEGACY_BIT 56
+#define MSR_HYGON_BP_CFG_IBRS_RAS_FLUSH_BIT 60
+
 #ifdef CONFIG_NUMA
 /*
  * To workaround broken NUMA config.  Read the comment in
@@ -183,9 +186,38 @@ clear_csv:
 	setup_clear_cpu_cap(X86_FEATURE_CSV3);
 }
 
+/*
+ * cpu_vul_mitigation() - set the basic configuration to mitigate CPU vulnerabilities
+ */
+static void cpu_vul_mitigation(void)
+{
+	/*
+	 * Automatically flush RAS upon protection level changes from low to high.
+	 * it's used as rsb mitigation instead of RSB filling.
+	 */
+	if ((boot_cpu_data.x86_vendor != X86_VENDOR_HYGON) ||
+		(boot_cpu_data.x86 != 0x18))
+		return;
+
+	switch (boot_cpu_data.x86_model) {
+	case 0x4 ... 0x6:
+	case 0xC:
+	case 0x10:
+		msr_set_bit(MSR_ZEN4_BP_CFG, MSR_HYGON_BP_CFG_IBRS_RAS_FLUSH_LEGACY_BIT);
+		break;
+	case 0x7 ... 0x9:
+		msr_set_bit(MSR_ZEN4_BP_CFG, MSR_HYGON_BP_CFG_IBRS_RAS_FLUSH_BIT);
+		break;
+	default:
+		return;
+	}
+}
+
 static void early_init_hygon(struct cpuinfo_x86 *c)
 {
 	u32 dummy;
+
+	cpu_vul_mitigation();
 
 	set_cpu_cap(c, X86_FEATURE_K8);
 
