@@ -255,11 +255,6 @@ config CC_HAS_MARCH_NATIVE
 	# usage warnings that only appear wth '-march=native'.
 	depends on CC_IS_GCC || CLANG_VERSION >= 190100
 
-
-choice
-	prompt "x86_64 Compiler Build Optimization"
-	default GENERIC_CPU
-	
 config RUSTC_HAS_APXF
 	# The kernel isn't ready for in-kernel APX instructions. Without
 	# explicit frontend gating of APX, the backend may emit those
@@ -269,6 +264,10 @@ config RUSTC_HAS_APXF
 	# emit an `apxf` target attribute that only LLVM 23+ can interpret.
 	def_bool (RUSTC_VERSION >= 108800 && RUSTC_LLVM_MAJOR_VERSION >= 23) || \
 		 RUSTC_VERSION >= 109300
+
+choice
+	prompt "x86_64 Compiler Build Optimization"
+	default GENERIC_CPU
 
 config X86_NATIVE_CPU
 	bool "Build and optimize for local/native CPU"
