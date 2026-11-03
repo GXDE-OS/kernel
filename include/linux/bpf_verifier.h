@@ -349,7 +349,11 @@ enum {
 	INSN_F_SPI_MASK = 0x3f, /* 6 bits */
 	INSN_F_SPI_SHIFT = 3, /* shifted 3 bits to the left */
 
-	INSN_F_STACK_ACCESS = BIT(9), /* we need 10 bits total */
+	INSN_F_STACK_ACCESS = BIT(9),
+
+	INSN_F_DST_REG_STACK = BIT(10), /* dst_reg is PTR_TO_STACK */
+	INSN_F_SRC_REG_STACK = BIT(11), /* src_reg is PTR_TO_STACK */
+	/* total 12 bits are used now. */
 };
 
 static_assert(INSN_F_FRAMENO_MASK + 1 >= MAX_CALL_FRAMES);
@@ -358,9 +362,9 @@ static_assert(INSN_F_SPI_MASK + 1 >= MAX_BPF_STACK / 8);
 struct bpf_jmp_history_entry {
 	u32 idx;
 	/* insn idx can't be bigger than 1 million */
-	u32 prev_idx : 22;
-	/* special flags, e.g., whether insn is doing register stack spill/load */
-	u32 flags : 10;
+	u32 prev_idx : 20;
+	/* special INSN_F_xxx flags */
+	u32 flags : 12;
 	/* additional registers that need precision tracking when this
 	 * jump is backtracked, vector of six 10-bit records
 	 */
@@ -666,6 +670,7 @@ struct bpf_verifier_env {
 	u32 prev_insn_idx;
 	struct bpf_prog *prog;		/* eBPF program being verified */
 	const struct bpf_verifier_ops *ops;
+	struct module *attach_btf_mod;	/* The owner module of prog->aux->attach_btf */
 	struct bpf_verifier_stack_elem *head; /* stack of verifier states to be processed */
 	int stack_size;			/* number of states to be processed */
 	bool strict_alignment;		/* perform strict pointer alignment checks */

@@ -1041,15 +1041,82 @@ void __init_or_module apply_seal_endbr(s32 *start, s32 *end) { }
 #endif /* CONFIG_X86_KERNEL_IBT */
 
 #ifdef CONFIG_FINEIBT
+#define __CFI_DEFAULT	CFI_DEFAULT
+#elif defined(CONFIG_CFI_CLANG)
+#define __CFI_DEFAULT	CFI_KCFI
+#else
+#define __CFI_DEFAULT	CFI_OFF
+#endif
 
-enum cfi_mode {
-	CFI_DEFAULT,
-	CFI_OFF,
-	CFI_KCFI,
-	CFI_FINEIBT,
-};
+enum cfi_mode cfi_mode __ro_after_init = __CFI_DEFAULT;
 
-static enum cfi_mode cfi_mode __ro_after_init = CFI_DEFAULT;
+#ifdef CONFIG_CFI_CLANG
+struct bpf_insn;
+
+/* Must match bpf_func_t / DEFINE_BPF_PROG_RUN() */
+extern unsigned int __bpf_prog_runX(const void *ctx,
+				    const struct bpf_insn *insn);
+
+/*
+ * Force a reference to the external symbol so the compiler generates
+ * __kcfi_typid.
+ */
+__ADDRESSABLE(__bpf_prog_runX);
+
+/* u32 __ro_after_init cfi_bpf_hash = __kcfi_typeid___bpf_prog_runX; */
+asm (
+"	.pushsection	.data..ro_after_init,\"aw\",@progbits	\n"
+"	.type	cfi_bpf_hash,@object				\n"
+"	.globl	cfi_bpf_hash					\n"
+"	.p2align	2, 0x0					\n"
+"cfi_bpf_hash:							\n"
+"	.long	__kcfi_typeid___bpf_prog_runX			\n"
+"	.size	cfi_bpf_hash, 4					\n"
+"	.popsection						\n"
+);
+
+/* Must match bpf_callback_t */
+extern u64 __bpf_callback_fn(u64, u64, u64, u64, u64);
+
+__ADDRESSABLE(__bpf_callback_fn);
+
+/* u32 __ro_after_init cfi_bpf_subprog_hash = __kcfi_typeid___bpf_callback_fn; */
+asm (
+"	.pushsection	.data..ro_after_init,\"aw\",@progbits	\n"
+"	.type	cfi_bpf_subprog_hash,@object			\n"
+"	.globl	cfi_bpf_subprog_hash				\n"
+"	.p2align	2, 0x0					\n"
+"cfi_bpf_subprog_hash:						\n"
+"	.long	__kcfi_typeid___bpf_callback_fn			\n"
+"	.size	cfi_bpf_subprog_hash, 4				\n"
+"	.popsection						\n"
+);
+
+u32 cfi_get_func_hash(void *func)
+{
+	u32 hash;
+
+	func -= cfi_get_offset();
+	switch (cfi_mode) {
+	case CFI_FINEIBT:
+		func += 7;
+		break;
+	case CFI_KCFI:
+		func += 1;
+		break;
+	default:
+		return 0;
+	}
+
+	if (get_kernel_nofault(hash, func))
+		return 0;
+
+	return hash;
+}
+#endif
+
+#ifdef CONFIG_FINEIBT
+
 static bool cfi_rand __ro_after_init = true;
 static u32  cfi_seed __ro_after_init;
 
@@ -1358,8 +1425,11 @@ static void __apply_fineibt(s32 *start_retpoline, s32 *end_retpoline,
 		goto err;
 
 	if (cfi_rand) {
-		if (builtin)
+		if (builtin) {
 			cfi_seed = get_random_u32();
+			cfi_bpf_hash = cfi_rehash(cfi_bpf_hash);
+			cfi_bpf_subprog_hash = cfi_rehash(cfi_bpf_subprog_hash);
+		}
 
 		ret = cfi_rand_preamble(start_cfi, end_cfi);
 		if (ret)
@@ -1992,6 +2062,25 @@ static void text_poke_memset(void *dst, const void *src, size_t len)
 
 typedef void text_poke_f(void *dst, const void *src, size_t len);
 
+#ifdef CONFIG_PTP
+static inline void set_ptes_text_poke(struct mm_struct *mm, unsigned long addr,
+		pte_t *ptep, pte_t pte, unsigned int nr)
+{
+	page_table_check_ptes_set(mm, ptep, pte, nr);
+
+	arch_enter_lazy_mmu_mode();
+	for (;;) {
+		compiletime_assert_rwonce_type(*ptep);
+		ptp_set_pte_text_poke(ptep, pte);
+		if (--nr == 0)
+			break;
+		ptep++;
+		pte = pte_next_pfn(pte);
+	}
+	arch_leave_lazy_mmu_mode();
+}
+#endif
+
 static void *__text_poke(text_poke_f func, void *addr, const void *src, size_t len)
 {
 	bool cross_page_boundary = offset_in_page(addr) + len > PAGE_SIZE;
@@ -2043,11 +2132,19 @@ static void *__text_poke(text_poke_f func, void *addr, const void *src, size_t l
 	local_irq_save(flags);
 
 	pte = mk_pte(pages[0], pgprot);
+#ifdef CONFIG_PTP
+	set_ptes_text_poke(poking_mm, poking_addr, ptep, pte, 1);
+#else
 	set_pte_at(poking_mm, poking_addr, ptep, pte);
+#endif
 
 	if (cross_page_boundary) {
 		pte = mk_pte(pages[1], pgprot);
+#ifdef CONFIG_PTP
+		set_ptes_text_poke(poking_mm, poking_addr + PAGE_SIZE, ptep + 1, pte, 1);
+#else
 		set_pte_at(poking_mm, poking_addr + PAGE_SIZE, ptep + 1, pte);
+#endif
 	}
 
 	/*

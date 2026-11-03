@@ -7,15 +7,22 @@
 #include <linux/bpf.h>
 #include <linux/btf.h>
 
-extern struct bpf_struct_ops bpf_bpf_dummy_ops;
+static struct bpf_struct_ops bpf_bpf_dummy_ops;
 
 /* A common type for test_N with return value in bpf_dummy_ops */
 typedef int (*dummy_ops_test_ret_fn)(struct bpf_dummy_ops_state *state, ...);
+
+static int dummy_ops_test_ret_function(struct bpf_dummy_ops_state *state, ...)
+{
+	return 0;
+}
 
 struct bpf_dummy_ops_test_args {
 	u64 args[MAX_BPF_FUNC_ARGS];
 	struct bpf_dummy_ops_state state;
 };
+
+static struct btf *bpf_dummy_ops_btf;
 
 static struct bpf_dummy_ops_test_args *
 dummy_ops_init_args(const union bpf_attr *kattr, unsigned int nr)
@@ -62,7 +69,7 @@ static int dummy_ops_copy_args(struct bpf_dummy_ops_test_args *args)
 
 static int dummy_ops_call_op(void *image, struct bpf_dummy_ops_test_args *args)
 {
-	dummy_ops_test_ret_fn test = (void *)image;
+	dummy_ops_test_ret_fn test = (void *)image + cfi_get_offset();
 	struct bpf_dummy_ops_state *state = NULL;
 
 	/* state needs to be NULL if args[0] is 0 */
@@ -85,9 +92,15 @@ int bpf_struct_ops_test_run(struct bpf_prog *prog, const union bpf_attr *kattr,
 	void *image = NULL;
 	unsigned int op_idx;
 	int prog_ret;
+	s32 type_id;
 	int err;
 
-	if (prog->aux->attach_btf_id != st_ops->type_id)
+	type_id = btf_find_by_name_kind(bpf_dummy_ops_btf,
+					bpf_bpf_dummy_ops.name,
+					BTF_KIND_STRUCT);
+	if (type_id < 0)
+		return -EINVAL;
+	if (prog->aux->attach_btf_id != type_id)
 		return -EOPNOTSUPP;
 
 	func_proto = prog->aux->attach_func_proto;
@@ -120,6 +133,7 @@ int bpf_struct_ops_test_run(struct bpf_prog *prog, const union bpf_attr *kattr,
 	op_idx = prog->expected_attach_type;
 	err = bpf_struct_ops_prepare_trampoline(tlinks, link,
 						&st_ops->func_models[op_idx],
+						&dummy_ops_test_ret_function,
 						image, image + PAGE_SIZE);
 	if (err < 0)
 		goto out;
@@ -143,6 +157,7 @@ out:
 
 static int bpf_dummy_init(struct btf *btf)
 {
+	bpf_dummy_ops_btf = btf;
 	return 0;
 }
 
@@ -220,7 +235,29 @@ static void bpf_dummy_unreg(void *kdata)
 {
 }
 
-struct bpf_struct_ops bpf_bpf_dummy_ops = {
+static int bpf_dummy_test_1(struct bpf_dummy_ops_state *cb)
+{
+	return 0;
+}
+
+static int bpf_dummy_test_2(struct bpf_dummy_ops_state *cb, int a1, unsigned short a2,
+			    char a3, unsigned long a4)
+{
+	return 0;
+}
+
+static int bpf_dummy_test_sleepable(struct bpf_dummy_ops_state *cb)
+{
+	return 0;
+}
+
+static struct bpf_dummy_ops __bpf_bpf_dummy_ops = {
+	.test_1 = bpf_dummy_test_1,
+	.test_2 = bpf_dummy_test_2,
+	.test_sleepable = bpf_dummy_test_sleepable,
+};
+
+static struct bpf_struct_ops bpf_bpf_dummy_ops = {
 	.verifier_ops = &bpf_dummy_verifier_ops,
 	.init = bpf_dummy_init,
 	.check_member = bpf_dummy_ops_check_member,
@@ -228,4 +265,12 @@ struct bpf_struct_ops bpf_bpf_dummy_ops = {
 	.reg = bpf_dummy_reg,
 	.unreg = bpf_dummy_unreg,
 	.name = "bpf_dummy_ops",
+	.cfi_stubs = &__bpf_bpf_dummy_ops,
+	.owner = THIS_MODULE,
 };
+
+static int __init bpf_dummy_struct_ops_init(void)
+{
+	return register_bpf_struct_ops(&bpf_bpf_dummy_ops, bpf_dummy_ops);
+}
+late_initcall(bpf_dummy_struct_ops_init);

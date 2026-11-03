@@ -100,6 +100,9 @@
 #ifdef CONFIG_IEE_PTRP
 #include <asm/haoc/iee-token.h>
 #endif
+#ifdef CONFIG_PTP
+#include <linux/haoc-ptp.h>
+#endif
 
 EXPORT_TRACEPOINT_SYMBOL_GPL(ipi_send_cpu);
 EXPORT_TRACEPOINT_SYMBOL_GPL(ipi_send_cpumask);
@@ -376,6 +379,17 @@ static void __sched_core_flip(bool enabled)
 		const struct cpumask *smt_mask = cpu_smt_mask(cpu);
 
 		sched_core_lock(cpu, &flags);
+
+		/*
+		 * A core-wide selection may have the shared rq lock temporarily
+		 * released by a lock-dropping ->pick_task(). Flipping would
+		 * rebind rq_lockp() under it. Wait it out.
+		 */
+		while (cpu_rq(cpu)->core->core_pick_in_flight) {
+			sched_core_unlock(cpu, &flags);
+			cpu_relax();
+			sched_core_lock(cpu, &flags);
+		}
 
 		for_each_cpu(t, smt_mask)
 			cpu_rq(t)->core_enabled = enabled;
@@ -1338,8 +1352,8 @@ void set_load_weight(struct task_struct *p, bool update_load)
 	 * SCHED_OTHER tasks have to update their load when changing their
 	 * weight
 	 */
-	if (update_load && p->sched_class == &fair_sched_class)
-		reweight_task(p, &lw);
+	if (update_load && p->sched_class->reweight_task)
+		p->sched_class->reweight_task(task_rq(p), p, &lw);
 	else
 		p->se.load = lw;
 }
@@ -2059,6 +2073,17 @@ static void block_task(struct rq *rq, struct task_struct *p, int flags)
 inline int task_curr(const struct task_struct *p)
 {
 	return cpu_curr(task_cpu(p)) == p;
+}
+
+/*
+ * ->switching_to() is called with the pi_lock and rq_lock held and must not
+ * mess with locking.
+ */
+void check_class_changing(struct rq *rq, struct task_struct *p,
+			  const struct sched_class *prev_class)
+{
+	if (prev_class != p->sched_class && p->sched_class->switching_to)
+		p->sched_class->switching_to(rq, p);
 }
 
 /*
@@ -4645,7 +4670,7 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 	return 0;
 }
 
-void sched_cgroup_fork(struct task_struct *p, struct kernel_clone_args *kargs)
+int sched_cgroup_fork(struct task_struct *p, struct kernel_clone_args *kargs)
 {
 	unsigned long flags;
 
@@ -4672,6 +4697,12 @@ void sched_cgroup_fork(struct task_struct *p, struct kernel_clone_args *kargs)
 	if (p->sched_class->task_fork)
 		p->sched_class->task_fork(p);
 	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+
+	return 0;
+}
+
+void sched_cancel_fork(struct task_struct *p)
+{
 }
 
 void sched_post_fork(struct task_struct *p)
@@ -5165,6 +5196,15 @@ asmlinkage __visible void schedule_tail(struct task_struct *prev)
 	calculate_sigpending();
 }
 
+#ifdef CONFIG_PTP
+void __weak ptp_context_enable_wp(int *wp_disabled_cnt, unsigned long *cr0) { }
+void __weak ptp_context_restore_wp(int wp_disabled_cnt, unsigned long cr0) { }
+#endif
+
+#if defined(CONFIG_IEE_PTRP) && !defined(CONFIG_IEE_PTRP_W) && defined(CONFIG_ARM64)
+extern void iee_cycle_verify_cred(struct task_struct *current_task);
+#endif
+
 /*
  * context_switch - switch to the new MM and the new thread's register state.
  */
@@ -5172,6 +5212,19 @@ static __always_inline struct rq *
 context_switch(struct rq *rq, struct task_struct *prev,
 	       struct task_struct *next, struct rq_flags *rf)
 {
+#if defined(CONFIG_IEE_PTRP) && !defined(CONFIG_IEE_PTRP_W)
+# if defined(CONFIG_ARM64)
+#  ifdef CONFIG_IEE_CS_CHECK
+	if (haoc_enabled) {
+		pr_info_once("HAOC: CONFIG_IEE_CS_CHECK enabled.");
+		iee_cycle_verify_cred(next);
+	}
+#  endif
+# elif defined(CONFIG_X86_64)
+	if (haoc_enabled)
+		iee_verify_token(next);
+# endif
+#endif
 	prepare_task_switch(rq, prev, next);
 
 	/*
@@ -5209,9 +5262,9 @@ context_switch(struct rq *rq, struct task_struct *prev,
 		 * case 'prev->active_mm == next->mm' through
 		 * finish_task_switch()'s mmdrop().
 		 */
-#ifdef CONFIG_IEE_PTRP
-		if(haoc_enabled)
-			iee_verify_token_pgd(next);
+#if defined(CONFIG_IEE_PTRP) && !defined(CONFIG_IEE_PTRP_W)
+		if (haoc_enabled)
+			iee_verify_pgd(next);
 #endif
 		switch_mm_irqs_off(prev->active_mm, next->mm, next);
 		lru_gen_use_mm(next->mm);
@@ -5229,8 +5282,20 @@ context_switch(struct rq *rq, struct task_struct *prev,
 	prepare_lock_switch(rq, next, rf);
 
 	/* Here we just switch the register state and the stack. */
+#if defined(CONFIG_PTP) && defined(CONFIG_X86_64)
+	int wp_disabled_cnt = 0;
+	unsigned long cr0 = 0;
+
+	ptp_context_enable_wp(&wp_disabled_cnt, &cr0);
+#endif
+
+	/* Here we just switch the register state and the stack. */
 	switch_to(prev, next, prev);
 	barrier();
+
+#if defined(CONFIG_PTP) && defined(CONFIG_X86_64)
+	ptp_context_restore_wp(wp_disabled_cnt, cr0);
+#endif
 
 	return finish_task_switch(prev);
 }
@@ -5966,6 +6031,8 @@ pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 		return __pick_next_task(rq, prev, rf);
 	}
 
+	rq->core->core_pick_in_flight++;
+
 	/*
 	 * If there were no {en,de}queues since we picked (IOW, the task
 	 * pointers are all still valid), and we haven't scheduled the last
@@ -6159,6 +6226,7 @@ pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 out_set_next:
 	set_next_task(rq, next);
 out:
+	rq->core->core_pick_in_flight--;
 	if (rq->core->core_forceidle_count && next == rq->idle)
 		queue_core_balance(rq);
 
@@ -6353,6 +6421,13 @@ static void sched_core_cpu_deactivate(unsigned int cpu)
 	core_rq->core_forceidle_count      = rq->core_forceidle_count;
 	core_rq->core_forceidle_seq        = rq->core_forceidle_seq;
 	core_rq->core_forceidle_occupation = rq->core_forceidle_occupation;
+
+	/*
+	 * A stale leftover would bias the count forever if this CPU later
+	 * returns as its own leader. Move, don't copy.
+	 */
+	core_rq->core_pick_in_flight       = rq->core_pick_in_flight;
+	rq->core_pick_in_flight            = 0;
 
 	/*
 	 * Accounting edge for forced idle is handled in pick_next_task().
@@ -7091,6 +7166,7 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
 
 	p->sched_class = next_class;
 	p->prio = prio;
+	check_class_changing(rq, p, prev_class);
 
 	if (queued)
 		enqueue_task(rq, p, queue_flag);
@@ -8264,12 +8340,12 @@ void __init sched_init(void)
 	int i;
 
 	/* Make sure the linker didn't screw up */
-	BUG_ON(&idle_sched_class != &fair_sched_class + 1 ||
-	       &fair_sched_class != &rt_sched_class + 1 ||
-	       &rt_sched_class   != &dl_sched_class + 1);
 #ifdef CONFIG_SMP
-	BUG_ON(&dl_sched_class != &stop_sched_class + 1);
+	BUG_ON(!sched_class_above(&stop_sched_class, &dl_sched_class));
 #endif
+	BUG_ON(!sched_class_above(&dl_sched_class, &rt_sched_class));
+	BUG_ON(!sched_class_above(&rt_sched_class, &fair_sched_class));
+	BUG_ON(!sched_class_above(&fair_sched_class, &idle_sched_class));
 
 	wait_bit_init();
 
@@ -8400,6 +8476,7 @@ void __init sched_init(void)
 		rq->core_forceidle_count = 0;
 		rq->core_forceidle_occupation = 0;
 		rq->core_forceidle_start = 0;
+		rq->core_pick_in_flight = 0;
 
 		rq->core_cookie = 0UL;
 #endif
@@ -9644,29 +9721,27 @@ static int cpu_local_stat_show(struct seq_file *sf,
 }
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
+
+static unsigned long tg_weight(struct task_group *tg)
+{
+	return scale_load_down(tg->shares);
+}
+
 static u64 cpu_weight_read_u64(struct cgroup_subsys_state *css,
 			       struct cftype *cft)
 {
-	struct task_group *tg = css_tg(css);
-	u64 weight = scale_load_down(tg->shares);
-
-	return DIV_ROUND_CLOSEST_ULL(weight * CGROUP_WEIGHT_DFL, 1024);
+	return sched_weight_to_cgroup(tg_weight(css_tg(css)));
 }
 
 static int cpu_weight_write_u64(struct cgroup_subsys_state *css,
-				struct cftype *cft, u64 weight)
+				struct cftype *cft, u64 cgrp_weight)
 {
-	/*
-	 * cgroup weight knobs should use the common MIN, DFL and MAX
-	 * values which are 1, 100 and 10000 respectively.  While it loses
-	 * a bit of range on both ends, it maps pretty well onto the shares
-	 * value used by scheduler and the round-trip conversions preserve
-	 * the original value over the entire range.
-	 */
-	if (weight < CGROUP_WEIGHT_MIN || weight > CGROUP_WEIGHT_MAX)
+	unsigned long weight;
+
+	if (cgrp_weight < CGROUP_WEIGHT_MIN || cgrp_weight > CGROUP_WEIGHT_MAX)
 		return -ERANGE;
 
-	weight = DIV_ROUND_CLOSEST_ULL(weight * 1024, CGROUP_WEIGHT_DFL);
+	weight = sched_weight_from_cgroup(cgrp_weight);
 
 	return sched_group_set_shares(css_tg(css), scale_load(weight));
 }
@@ -9674,7 +9749,7 @@ static int cpu_weight_write_u64(struct cgroup_subsys_state *css,
 static s64 cpu_weight_nice_read_s64(struct cgroup_subsys_state *css,
 				    struct cftype *cft)
 {
-	unsigned long weight = scale_load_down(css_tg(css)->shares);
+	unsigned long weight = tg_weight(css_tg(css));
 	int last_delta = INT_MAX;
 	int prio, delta;
 

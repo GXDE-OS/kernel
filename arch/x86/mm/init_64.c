@@ -59,6 +59,10 @@
 #ifdef CONFIG_IEE
 #include <asm/haoc/iee.h>
 #endif
+#ifdef CONFIG_IEE_SIP
+#include <asm/haoc/iee-access.h>
+#include <asm/haoc/iee-si.h>
+#endif
 #include "mm_internal.h"
 
 #include "ident_map.c"
@@ -551,7 +555,7 @@ phys_pmd_init(pmd_t *pmd_page, unsigned long paddr, unsigned long paddr_end,
 		}
 
 		if (!pmd_none(*pmd)) {
-			if (!pmd_large(*pmd)) {
+			if (!pmd_leaf(*pmd)) {
 				spin_lock(&init_mm.page_table_lock);
 				pte = (pte_t *)pmd_page_vaddr(*pmd);
 				paddr_last = phys_pte_init(pte, paddr,
@@ -1148,7 +1152,7 @@ remove_pmd_table(pmd_t *pmd_start, unsigned long addr, unsigned long end,
 		if (!pmd_present(*pmd))
 			continue;
 
-		if (pmd_large(*pmd)) {
+		if (pmd_leaf(*pmd)) {
 			if (IS_ALIGNED(addr, PMD_SIZE) &&
 			    IS_ALIGNED(next, PMD_SIZE)) {
 				if (!direct)
@@ -1364,6 +1368,10 @@ failed:
 
 void __init mem_init(void)
 {
+#ifdef CONFIG_IEE
+	iee_early_init();
+#endif
+
 	pci_iommu_alloc();
 
 	/* clear_bss() already clear the empty_zero_page */
@@ -1385,19 +1393,11 @@ void __init mem_init(void)
 	if (get_gate_vma(&init_mm))
 		kclist_add(&kcore_vsyscall, (void *)VSYSCALL_ADDR, PAGE_SIZE, KCORE_USER);
 
-	#ifdef CONFIG_IEE
-	/*
-	 * Split the linear mapping region of the kernel address space into two equally-sized parts.
-	 * The lower region retains the original linear mapping.
-	 * The upper region becomes the IEE linear mapping area.
-	 * Note that the IEE mapping region is mapped with read-only permissions.
-	 */
-	if (haoc_enabled) {
-		pr_info("HAOC is enabled by kernel command line.");
-		iee_init();
-	}
-	#endif
 	preallocate_vmalloc_pages();
+
+#ifdef CONFIG_IEE
+	iee_init();
+#endif
 }
 
 #ifdef CONFIG_DEFERRED_STRUCT_PAGE_INIT
@@ -1412,7 +1412,11 @@ int __init deferred_page_init_max_threads(const struct cpumask *node_cpumask)
 }
 #endif
 
+#ifdef CONFIG_IEE_SIP
+int kernel_set_to_readonly __iee_si_data;
+#else
 int kernel_set_to_readonly;
+#endif
 
 void mark_rodata_ro(void)
 {
@@ -1422,12 +1426,17 @@ void mark_rodata_ro(void)
 	unsigned long text_end = PFN_ALIGN(_etext);
 	unsigned long rodata_end = PFN_ALIGN(__end_rodata);
 	unsigned long all_end;
+#ifdef CONFIG_IEE_SIP
+	int kernel_set_to_readonly_value = 1;
+#endif
 
 	printk(KERN_INFO "Write protecting the kernel read-only data: %luk\n",
 	       (end - start) >> 10);
 	set_memory_ro(start, (end - start) >> PAGE_SHIFT);
 
+#ifndef CONFIG_IEE_SIP
 	kernel_set_to_readonly = 1;
+#endif
 
 	/*
 	 * The rodata/data/bss/brk section (but not the kernel text!)
@@ -1460,6 +1469,10 @@ void mark_rodata_ro(void)
 				(void *)rodata_end, (void *)_sdata);
 
 	debug_checkwx();
+#ifdef CONFIG_IEE_SIP
+	iee_memcpy(&kernel_set_to_readonly, &kernel_set_to_readonly_value,
+		   sizeof(int));
+#endif
 }
 
 /*
@@ -1568,9 +1581,9 @@ void __meminit vmemmap_set_pmd(pmd_t *pmd, void *p, int node,
 int __meminit vmemmap_check_pmd(pmd_t *pmd, int node,
 				unsigned long addr, unsigned long next)
 {
-	int large = pmd_large(*pmd);
+	int large = pmd_leaf(*pmd);
 
-	if (pmd_large(*pmd)) {
+	if (pmd_leaf(*pmd)) {
 		vmemmap_verify((pte_t *)pmd, node, addr, next);
 		vmemmap_use_sub_pmd(addr, next);
 	}

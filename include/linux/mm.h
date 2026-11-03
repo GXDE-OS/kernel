@@ -31,6 +31,9 @@
 #include <linux/memremap.h>
 #include <linux/slab.h>
 #include <linux/deepin_kabi.h>
+#ifdef CONFIG_PTP
+#include <linux/ptp-cache.h>
+#endif
 
 struct mempolicy;
 struct anon_vma;
@@ -2941,7 +2944,15 @@ static inline bool pagetable_is_reserved(struct ptdesc *pt)
  */
 static inline struct ptdesc *pagetable_alloc(gfp_t gfp, unsigned int order)
 {
+#ifdef CONFIG_PTP
+	struct page *page;
+	void *pt_page;
+
+	pt_page = iee_cache_alloc(&pg_cache, gfp);
+	page = !!pt_page ? virt_to_page(pt_page) : NULL;
+#else
 	struct page *page = alloc_pages(gfp | __GFP_COMP, order);
+#endif
 
 	return page_ptdesc(page);
 }
@@ -2957,7 +2968,11 @@ static inline void pagetable_free(struct ptdesc *pt)
 {
 	struct page *page = ptdesc_page(pt);
 
+#ifdef CONFIG_PTP
+	iee_cache_free(&pg_cache, page_address(page));
+#else
 	__free_pages(page, compound_order(page));
+#endif
 }
 
 #if USE_SPLIT_PTE_PTLOCKS
@@ -3362,7 +3377,7 @@ extern int insert_vm_struct(struct mm_struct *, struct vm_area_struct *);
 extern void unlink_file_vma(struct vm_area_struct *);
 extern struct vm_area_struct *copy_vma(struct vm_area_struct **,
 	unsigned long addr, unsigned long len, pgoff_t pgoff,
-	bool *need_rmap_locks);
+	bool *need_rmap_locks, bool keep_source);
 extern void exit_mmap(struct mm_struct *);
 struct vm_area_struct *vma_modify(struct vma_iterator *vmi,
 				  struct vm_area_struct *prev,

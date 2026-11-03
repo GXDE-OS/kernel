@@ -83,6 +83,9 @@
 #ifdef CONFIG_USER_NS
 #include <linux/user_namespace.h>
 #endif
+#ifdef CONFIG_VARP
+#include <asm/haoc/iee-varp.h>
+#endif
 
 /* shared constants to be used in various sysctls */
 const int sysctl_vals[] = { 0, 1, 2, 3, 4, 100, 200, 1000, 3000, INT_MAX, 65535, -1 };
@@ -208,6 +211,37 @@ static int _proc_do_string(char *data, int maxlen, int write,
 	return 0;
 }
 
+#ifdef CONFIG_VARP
+static int _iee_proc_do_string(char *data, int maxlen, int write,
+		char *buffer, size_t *lenp, loff_t *ppos)
+{
+	size_t len;
+
+	if (!data || !maxlen || !*lenp || !buffer) {
+		*lenp = 0;
+		return 0;
+	}
+
+	if (sysctl_writes_strict == SYSCTL_WRITES_STRICT) {
+		/* Only continue writes not past the end of buffer. */
+		len = strlen(data);
+		if (len > maxlen - 1)
+			len = maxlen - 1;
+
+		if (*ppos > len)
+			return 0;
+		len = *ppos;
+	} else {
+		/* Start writing from beginning of buffer. */
+		len = 0;
+	}
+
+	*ppos += *lenp;
+	iee_set_varp_modprobe_path(data, maxlen, len, buffer, lenp);
+	return 0;
+}
+#endif
+
 static void warn_sysctl_write(struct ctl_table *table)
 {
 	pr_warn_once("%s wrote to %s when file position was not 0!\n"
@@ -264,6 +298,12 @@ int proc_dostring(struct ctl_table *table, int write,
 {
 	if (write)
 		proc_first_pos_non_zero_ignore(ppos, table);
+
+#ifdef CONFIG_VARP
+	if (table && table->data == modprobe_path && write)
+		return _iee_proc_do_string(table->data, table->maxlen, write, buffer, lenp,
+					       ppos);
+#endif
 
 	return _proc_do_string(table->data, table->maxlen, write, buffer, lenp,
 			ppos);
@@ -1334,10 +1374,13 @@ static int proc_do_cad_pid(struct ctl_table *table, int write, void *buffer,
 		size_t *lenp, loff_t *ppos)
 {
 	struct pid *new_pid;
+	struct pid *old_pid;
 	pid_t tmp;
 	int r;
 
-	tmp = pid_vnr(cad_pid);
+	rcu_read_lock();
+	tmp = pid_vnr(rcu_dereference(cad_pid));
+	rcu_read_unlock();
 
 	r = __do_proc_dointvec(&tmp, table, write, buffer,
 			       lenp, ppos, NULL, NULL);
@@ -1348,7 +1391,13 @@ static int proc_do_cad_pid(struct ctl_table *table, int write, void *buffer,
 	if (!new_pid)
 		return -ESRCH;
 
-	put_pid(xchg(&cad_pid, new_pid));
+	old_pid = unrcu_pointer(xchg(&cad_pid, RCU_INITIALIZER(new_pid)));
+	/*
+	 * Wait for cad_pid readers before put_pid().  We cannot use
+	 * call_rcu() here because free_pid() already owns pid->rcu.
+	 */
+	synchronize_rcu();
+	put_pid(old_pid);
 	return 0;
 }
 

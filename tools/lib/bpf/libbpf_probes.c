@@ -326,6 +326,7 @@ static int probe_map_create(enum bpf_map_type map_type)
 	case BPF_MAP_TYPE_STRUCT_OPS:
 		/* we'll get -ENOTSUPP for invalid BTF type ID for struct_ops */
 		opts.btf_vmlinux_value_type_id = 1;
+		opts.value_type_btf_obj_fd = -1;
 		exp_err = -524; /* -ENOTSUPP */
 		break;
 	case BPF_MAP_TYPE_BLOOM_FILTER:
@@ -435,7 +436,8 @@ int libbpf_probe_bpf_helper(enum bpf_prog_type prog_type, enum bpf_func_id helpe
 	/* If BPF verifier doesn't recognize BPF helper ID (enum bpf_func_id)
 	 * at all, it will emit something like "invalid func unknown#181".
 	 * If BPF verifier recognizes BPF helper but it's not supported for
-	 * given BPF program type, it will emit "unknown func bpf_sys_bpf#166".
+	 * given BPF program type, it will emit "unknown func bpf_sys_bpf#166"
+	 * or "program of this type cannot use helper bpf_sys_bpf#166".
 	 * In both cases, provided combination of BPF program type and BPF
 	 * helper is not supported by the kernel.
 	 * In all other cases, probe_prog_load() above will either succeed (e.g.,
@@ -444,7 +446,8 @@ int libbpf_probe_bpf_helper(enum bpf_prog_type prog_type, enum bpf_func_id helpe
 	 * that), or we'll get some more specific BPF verifier error about
 	 * some unsatisfied conditions.
 	 */
-	if (ret == 0 && (strstr(buf, "invalid func ") || strstr(buf, "unknown func ")))
+	if (ret == 0 && (strstr(buf, "invalid func ") || strstr(buf, "unknown func ") ||
+			 strstr(buf, "program of this type cannot use helper ")))
 		return 0;
 	return 1; /* assume supported */
 }

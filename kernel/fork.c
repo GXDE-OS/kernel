@@ -121,6 +121,16 @@
 #ifdef CONFIG_IEE_PTRP
 #include <asm/haoc/iee-token.h>
 #endif
+#ifdef CONFIG_IEE
+#include <asm/haoc/iee.h>
+#endif
+#ifdef CONFIG_PTP
+#include <linux/haoc-ptp.h>
+#endif
+
+#if defined(CONFIG_IEE_PTRP) && !defined(CONFIG_IEE_PTRP_W) && defined(CONFIG_ARM64)
+extern void iee_cycle_verify_cred(struct task_struct *current_task);
+#endif
 
 /*
  * Minimum number of threads to boot the kernel
@@ -1340,6 +1350,9 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 #endif
 	mm_init_uprobes_state(mm);
 	hugetlb_count_init(mm);
+#ifdef CONFIG_FUTEX
+	atomic64_set(&mm->futex_unique_id, 0);
+#endif
 
 	if (current->mm) {
 		mm->flags = mmf_init_flags(current->mm->flags);
@@ -2397,8 +2410,19 @@ __latent_entropy struct task_struct *copy_process(
 	if (!p)
 		goto fork_out;
 #ifdef CONFIG_IEE_PTRP
-	if(haoc_enabled)
+	if (haoc_enabled)
 		iee_validate_token(p);
+#endif
+#if defined(CONFIG_IEE_PTRP) && !defined(CONFIG_IEE_PTRP_W)
+# if defined(CONFIG_ARM64)
+#  ifdef CONFIG_IEE_IO_CHECK
+	if (haoc_enabled)
+		iee_cycle_verify_cred(current);
+#  endif
+# elif defined(CONFIG_X86_64)
+	if (haoc_enabled)
+		iee_verify_token(current);
+# endif
 #endif
 	p->flags &= ~PF_KTHREAD;
 	if (args->kthread)
@@ -2544,7 +2568,7 @@ __latent_entropy struct task_struct *copy_process(
 
 	retval = perf_event_init_task(p, clone_flags);
 	if (retval)
-		goto bad_fork_cleanup_policy;
+		goto bad_fork_sched_cancel_fork;
 	retval = audit_alloc(p);
 	if (retval)
 		goto bad_fork_cleanup_perf;
@@ -2676,7 +2700,9 @@ __latent_entropy struct task_struct *copy_process(
 	 * cgroup specific, it unconditionally needs to place the task on a
 	 * runqueue.
 	 */
-	sched_cgroup_fork(p, args);
+	retval = sched_cgroup_fork(p, args);
+	if (retval)
+		goto bad_fork_cancel_cgroup;
 
 	/*
 	 * From this point on we must avoid any synchronous user-space
@@ -2722,13 +2748,13 @@ __latent_entropy struct task_struct *copy_process(
 	/* Don't start children in a dying pid namespace */
 	if (unlikely(!(ns_of_pid(pid)->pid_allocated & PIDNS_ADDING))) {
 		retval = -ENOMEM;
-		goto bad_fork_cancel_cgroup;
+		goto bad_fork_core_free;
 	}
 
 	/* Let kill terminate clone/fork in the middle */
 	if (fatal_signal_pending(current)) {
 		retval = -EINTR;
-		goto bad_fork_cancel_cgroup;
+		goto bad_fork_core_free;
 	}
 
 	/* No more failure paths after this point. */
@@ -2802,10 +2828,11 @@ __latent_entropy struct task_struct *copy_process(
 
 	return p;
 
-bad_fork_cancel_cgroup:
+bad_fork_core_free:
 	sched_core_free(p);
 	spin_unlock(&current->sighand->siglock);
 	write_unlock_irq(&tasklist_lock);
+bad_fork_cancel_cgroup:
 	cgroup_cancel_fork(p, args);
 bad_fork_put_pidfd:
 	if (clone_flags & CLONE_PIDFD) {
@@ -2844,6 +2871,8 @@ bad_fork_cleanup_audit:
 	audit_free(p);
 bad_fork_cleanup_perf:
 	perf_event_free_task(p);
+bad_fork_sched_cancel_fork:
+	sched_cancel_fork(p);
 bad_fork_cleanup_policy:
 	lockdep_free_task(p);
 #ifdef CONFIG_NUMA
@@ -2925,6 +2954,11 @@ struct task_struct *create_io_thread(int (*fn)(void *), void *arg, int node)
 	return copy_process(NULL, 0, node, &args);
 }
 
+#ifdef CONFIG_PTP
+void __weak ptp_disable_wp(unsigned long *cr0) { }
+void __weak ptp_restore_wp(unsigned long cr0) { }
+#endif
+
 /*
  *  Ok, this is the main fork-routine.
  *
@@ -2941,6 +2975,9 @@ pid_t kernel_clone(struct kernel_clone_args *args)
 	struct task_struct *p;
 	int trace = 0;
 	pid_t nr;
+#if defined(CONFIG_PTP) && defined(CONFIG_X86_64)
+	unsigned long cr0;
+#endif
 
 	/*
 	 * For legacy clone() calls, CLONE_PIDFD uses the parent_tid argument
@@ -2974,7 +3011,13 @@ pid_t kernel_clone(struct kernel_clone_args *args)
 			trace = 0;
 	}
 
+#if defined(CONFIG_PTP) && defined(CONFIG_X86_64)
+	ptp_disable_wp(&cr0);
+#endif
 	p = copy_process(NULL, trace, NUMA_NO_NODE, args);
+#if defined(CONFIG_PTP) && defined(CONFIG_X86_64)
+	ptp_restore_wp(cr0);
+#endif
 	add_latent_entropy();
 
 	if (IS_ERR(p))

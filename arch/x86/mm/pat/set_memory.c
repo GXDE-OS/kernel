@@ -709,7 +709,7 @@ pte_t *lookup_address_in_pgd_attr(pgd_t *pgd, unsigned long address,
 		return NULL;
 
 	*level = PG_LEVEL_2M;
-	if (pmd_large(*pmd) || !pmd_present(*pmd))
+	if (pmd_leaf(*pmd) || !pmd_present(*pmd))
 		return (pte_t *)pmd;
 
 	*nx |= pmd_flags(*pmd) & _PAGE_NX;
@@ -835,7 +835,11 @@ EXPORT_SYMBOL_GPL(slow_virt_to_phys);
 static void __set_pmd_pte(pte_t *kpte, unsigned long address, pte_t pte)
 {
 	/* change init_mm */
+#ifdef CONFIG_PTP
+	ptp_set_sx_pte(kpte, pte);
+#else
 	set_pte_atomic(kpte, pte);
+#endif
 #ifdef CONFIG_X86_32
 	if (!SHARED_KERNEL_PMD) {
 		struct page *page;
@@ -1068,7 +1072,11 @@ static void split_set_pte(struct cpa_data *cpa, pte_t *pte, unsigned long pfn,
 	else
 		pr_warn_once("CPA: Cannot fixup static protections for PUD split\n");
 set:
+#ifdef CONFIG_PTP
+	ptp_set_sx_pte(pte, pfn_pte(pfn, ref_prot));
+#else
 	set_pte(pte, pfn_pte(pfn, ref_prot));
+#endif
 }
 
 static int
@@ -1267,7 +1275,7 @@ static void unmap_pmd_range(pud_t *pud, unsigned long start, unsigned long end)
 	 * Try to unmap in 2M chunks.
 	 */
 	while (end - start >= PMD_SIZE) {
-		if (pmd_large(*pmd))
+		if (pmd_leaf(*pmd))
 			pmd_clear(pmd);
 		else
 			__unmap_pmd_range(pud, pmd, start, start + PMD_SIZE);
@@ -1670,7 +1678,11 @@ repeat:
 		 * Do we really change anything ?
 		 */
 		if (pte_val(old_pte) != pte_val(new_pte)) {
+#ifdef CONFIG_PTP
+			ptp_set_sx_pte(kpte, new_pte);
+#else
 			set_pte_atomic(kpte, new_pte);
+#endif
 			cpa->flags |= CPA_FLUSHTLB;
 		}
 		cpa->numpages = 1;

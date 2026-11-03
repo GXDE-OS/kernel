@@ -31,6 +31,9 @@
 #include <linux/uaccess.h>
 #include <linux/kobject.h>
 #include <linux/ctype.h>
+#ifdef CONFIG_IEE_SELINUX_P
+#include <asm/haoc/iee-selinux.h>
+#endif
 
 /* selinuxfs pseudo filesystem for exporting the security policy API.
    Based on the proc code and the fs/nfsd/nfsctl.c code. */
@@ -74,7 +77,6 @@ struct selinux_fs_info {
 	int *bool_pending_values;
 	struct dentry *class_dir;
 	unsigned long last_class_ino;
-	bool policy_opened;
 	struct dentry *policycap_dir;
 	unsigned long last_ino;
 	struct super_block *sb;
@@ -343,47 +345,46 @@ struct policy_load_memory {
 
 static int sel_open_policy(struct inode *inode, struct file *filp)
 {
-	struct selinux_fs_info *fsi = inode->i_sb->s_fs_info;
 	struct policy_load_memory *plm = NULL;
 	int rc;
-
-	BUG_ON(filp->private_data);
-
-	mutex_lock(&selinux_state.policy_mutex);
 
 	rc = avc_has_perm(current_sid(), SECINITSID_SECURITY,
 			  SECCLASS_SECURITY, SECURITY__READ_POLICY, NULL);
 	if (rc)
-		goto err;
+		return rc;
 
-	rc = -EBUSY;
-	if (fsi->policy_opened)
-		goto err;
-
-	rc = -ENOMEM;
 	plm = kzalloc(sizeof(*plm), GFP_KERNEL);
 	if (!plm)
-		goto err;
+		return -ENOMEM;
 
+#ifdef CONFIG_IEE_SELINUX_P
+	mutex_lock(iee_get_selinux_policy_lock());
+#else
+	mutex_lock(&selinux_state.policy_mutex);
+#endif
 	rc = security_read_policy(&plm->data, &plm->len);
 	if (rc)
 		goto err;
-
 	if ((size_t)i_size_read(inode) != plm->len) {
 		inode_lock(inode);
 		i_size_write(inode, plm->len);
 		inode_unlock(inode);
 	}
-
-	fsi->policy_opened = 1;
+#ifdef CONFIG_IEE_SELINUX_P
+	mutex_unlock(iee_get_selinux_policy_lock());
+#else
+	mutex_unlock(&selinux_state.policy_mutex);
+#endif
 
 	filp->private_data = plm;
 
-	mutex_unlock(&selinux_state.policy_mutex);
-
 	return 0;
 err:
+#ifdef CONFIG_IEE_SELINUX_P
+	mutex_unlock(iee_get_selinux_policy_lock());
+#else
 	mutex_unlock(&selinux_state.policy_mutex);
+#endif
 
 	if (plm)
 		vfree(plm->data);
@@ -393,12 +394,7 @@ err:
 
 static int sel_release_policy(struct inode *inode, struct file *filp)
 {
-	struct selinux_fs_info *fsi = inode->i_sb->s_fs_info;
 	struct policy_load_memory *plm = filp->private_data;
-
-	BUG_ON(!plm);
-
-	fsi->policy_opened = 0;
 
 	vfree(plm->data);
 	kfree(plm);
@@ -585,7 +581,11 @@ static ssize_t sel_write_load(struct file *file, const char __user *buf,
 		goto out;
 	}
 
+#ifdef CONFIG_IEE_SELINUX_P
+	mutex_lock(iee_get_selinux_policy_lock());
+#else
 	mutex_lock(&selinux_state.policy_mutex);
+#endif
 	length = security_load_policy(data, count, &load_state);
 	if (length) {
 		pr_warn_ratelimited("SELinux: failed to load policy\n");
@@ -607,7 +607,11 @@ static ssize_t sel_write_load(struct file *file, const char __user *buf,
 		audit_get_sessionid(current));
 
 out_unlock:
+#ifdef CONFIG_IEE_SELINUX_P
+	mutex_unlock(iee_get_selinux_policy_lock());
+#else
 	mutex_unlock(&selinux_state.policy_mutex);
+#endif
 out:
 	vfree(data);
 	return length;
@@ -1192,7 +1196,11 @@ static ssize_t sel_read_bool(struct file *filep, char __user *buf,
 	unsigned index = file_inode(filep)->i_ino & SEL_INO_MASK;
 	const char *name = filep->f_path.dentry->d_name.name;
 
+#ifdef CONFIG_IEE_SELINUX_P
+	mutex_lock(iee_get_selinux_policy_lock());
+#else
 	mutex_lock(&selinux_state.policy_mutex);
+#endif
 
 	ret = -EINVAL;
 	if (index >= fsi->bool_num || strcmp(name,
@@ -1211,14 +1219,22 @@ static ssize_t sel_read_bool(struct file *filep, char __user *buf,
 	}
 	length = scnprintf(page, PAGE_SIZE, "%d %d", cur_enforcing,
 			  fsi->bool_pending_values[index]);
+#ifdef CONFIG_IEE_SELINUX_P
+	mutex_unlock(iee_get_selinux_policy_lock());
+#else
 	mutex_unlock(&selinux_state.policy_mutex);
+#endif
 	ret = simple_read_from_buffer(buf, count, ppos, page, length);
 out_free:
 	free_page((unsigned long)page);
 	return ret;
 
 out_unlock:
+#ifdef CONFIG_IEE_SELINUX_P
+	mutex_unlock(iee_get_selinux_policy_lock());
+#else
 	mutex_unlock(&selinux_state.policy_mutex);
+#endif
 	goto out_free;
 }
 
@@ -1243,7 +1259,11 @@ static ssize_t sel_write_bool(struct file *filep, const char __user *buf,
 	if (IS_ERR(page))
 		return PTR_ERR(page);
 
+#ifdef CONFIG_IEE_SELINUX_P
+	mutex_lock(iee_get_selinux_policy_lock());
+#else
 	mutex_lock(&selinux_state.policy_mutex);
+#endif
 
 	length = avc_has_perm(current_sid(), SECINITSID_SECURITY,
 			      SECCLASS_SECURITY, SECURITY__SETBOOL,
@@ -1267,7 +1287,11 @@ static ssize_t sel_write_bool(struct file *filep, const char __user *buf,
 	length = count;
 
 out:
+#ifdef CONFIG_IEE_SELINUX_P
+	mutex_unlock(iee_get_selinux_policy_lock());
+#else
 	mutex_unlock(&selinux_state.policy_mutex);
+#endif
 	kfree(page);
 	return length;
 }
@@ -1298,7 +1322,11 @@ static ssize_t sel_commit_bools_write(struct file *filep,
 	if (IS_ERR(page))
 		return PTR_ERR(page);
 
+#ifdef CONFIG_IEE_SELINUX_P
+	mutex_lock(iee_get_selinux_policy_lock());
+#else
 	mutex_lock(&selinux_state.policy_mutex);
+#endif
 
 	length = avc_has_perm(current_sid(), SECINITSID_SECURITY,
 			      SECCLASS_SECURITY, SECURITY__SETBOOL,
@@ -1319,7 +1347,11 @@ static ssize_t sel_commit_bools_write(struct file *filep,
 		length = count;
 
 out:
+#ifdef CONFIG_IEE_SELINUX_P
+	mutex_unlock(iee_get_selinux_policy_lock());
+#else
 	mutex_unlock(&selinux_state.policy_mutex);
+#endif
 	kfree(page);
 	return length;
 }

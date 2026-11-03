@@ -1794,7 +1794,6 @@ static void crypt_dec_pending(struct dm_crypt_io *io)
 {
 	struct crypt_config *cc = io->cc;
 	struct bio *base_bio = io->base_bio;
-	blk_status_t error = io->error;
 
 	if (!atomic_dec_and_test(&io->io_pending))
 		return;
@@ -1816,7 +1815,7 @@ static void crypt_dec_pending(struct dm_crypt_io *io)
 	else
 		kfree(io->integrity_metadata);
 
-	base_bio->bi_status = error;
+	base_bio->bi_status = io->error;
 
 	bio_endio(base_bio);
 }
@@ -2505,7 +2504,11 @@ static int set_key_encrypted(struct crypt_config *cc, struct key *key)
 {
 	const struct encrypted_key_payload *ekp;
 
+#ifdef CONFIG_KEYP
+	ekp = ((union key_payload *)(key->name_link.next))->data[0];
+#else
 	ekp = key->payload.data[0];
+#endif
 	if (!ekp)
 		return -EKEYREVOKED;
 
@@ -2521,7 +2524,11 @@ static int set_key_trusted(struct crypt_config *cc, struct key *key)
 {
 	const struct trusted_key_payload *tkp;
 
+#ifdef CONFIG_KEYP
+	tkp = ((union key_payload *)(key->name_link.next))->data[0];
+#else
 	tkp = key->payload.data[0];
+#endif
 	if (!tkp)
 		return -EKEYREVOKED;
 
@@ -2583,17 +2590,29 @@ static int crypt_set_keyring_key(struct crypt_config *cc, const char *key_string
 		return PTR_ERR(key);
 	}
 
+#ifdef CONFIG_KEYP
+	down_read(&KEY_SEM(key));
+#else
 	down_read(&key->sem);
+#endif
 
 	ret = set_key(cc, key);
 	if (ret < 0) {
+#ifdef CONFIG_KEYP
+		up_read(&KEY_SEM(key));
+#else
 		up_read(&key->sem);
+#endif
 		key_put(key);
 		kfree_sensitive(new_key_string);
 		return ret;
 	}
 
+#ifdef CONFIG_KEYP
+	up_read(&KEY_SEM(key));
+#else
 	up_read(&key->sem);
+#endif
 	key_put(key);
 
 	/* clear the flag since following operations may invalidate previously valid key */
@@ -2949,8 +2968,13 @@ static int crypt_ctr_cipher_new(struct dm_target *ti, char *cipher_in, char *key
 		}
 	}
 
-	if (*ivmode && !strcmp(*ivmode, "lmk"))
+	if (*ivmode && !strcmp(*ivmode, "lmk")) {
+		if (crypt_integrity_aead(cc)) {
+			ti->error = "AEAD transforms not supported for LMK";
+			return -EINVAL;
+		}
 		cc->tfms_count = 64;
+	}
 
 	if (*ivmode && !strcmp(*ivmode, "essiv")) {
 		if (!*ivopts) {

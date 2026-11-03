@@ -67,6 +67,7 @@ struct jit_ctx {
 	int exentry_idx;
 	u32 *image;		// JITed instruction
 	u32 *ro_image;
+	bool sizing;		// measuring pass: emit the worst-case encodings
 	u32 stack_size;
 };
 
@@ -227,6 +228,32 @@ static void emit_sw64_ldu64(const int dst, const u64 imm, struct jit_ctx *ctx)
 
 	emit_sw64_ld32_hi(dst, hi, ctx);
 	emit_sw64_ldu32(reg_tmp, lo, ctx);
+	emit(SW64_BPF_BIS_REG(dst, reg_tmp, dst), ctx);
+
+	put_tmp_reg(ctx);
+}
+
+/* Load an address that is only final in the real pass. The instruction count
+ * of emit_sw64_ldu64() depends on the value, so the measuring pass reserves
+ * the longest form (8 instructions: ld32_hi + ldu32 + bis) instead of the one
+ * the stack-local address would need.
+ */
+static void emit_sw64_ldu64_addr(const int dst, const u64 addr, struct jit_ctx *ctx)
+{
+	u8 reg_tmp;
+
+	if (!ctx->sizing)
+		return emit_sw64_ldu64(dst, addr, ctx);
+
+	reg_tmp = get_tmp_reg(ctx);
+
+	emit(SW64_BPF_LDIH(dst, SW64_BPF_REG_ZR, S16_MIN), ctx);
+	emit(SW64_BPF_LDI(dst, dst, S16_MIN), ctx);
+	emit(SW64_BPF_SLL_IMM(dst, 32, dst), ctx);
+	emit(SW64_BPF_LDIH(reg_tmp, SW64_BPF_REG_ZR, S16_MAX), ctx);
+	emit(SW64_BPF_ADDL_REG(reg_tmp, reg_tmp, reg_tmp), ctx);
+	emit(SW64_BPF_LDI(reg_tmp, reg_tmp, S16_MIN), ctx);
+	emit(SW64_BPF_ZAP_IMM(reg_tmp, 0xf0, reg_tmp), ctx);
 	emit(SW64_BPF_BIS_REG(dst, reg_tmp, dst), ctx);
 
 	put_tmp_reg(ctx);
@@ -1519,7 +1546,7 @@ static void emit_sw64_call(u64 target, struct jit_ctx *ctx)
 	unsigned long ip = (unsigned long)(ctx->ro_image + ctx->idx);
 	s64 offset = (s64)((unsigned long)target - (unsigned long)ip);
 
-	if (offset >= -0x100000 && offset <= 0xfffff) {
+	if (!ctx->sizing && offset >= -0x100000 && offset <= 0xfffff) {
 		s32 jmp_offset = (s32)offset;
 		/* we must remember br in sw is 4 * disp， and -1 is for pc will add 1 when exec */
 		jmp_offset = jmp_offset/4 - 1;
@@ -1697,6 +1724,7 @@ static int __arch_prepare_bpf_trampoline(struct jit_ctx *ctx, struct bpf_tramp_i
 	struct bpf_tramp_links *fentry = &tlinks[BPF_TRAMP_FENTRY];
 	struct bpf_tramp_links *fexit = &tlinks[BPF_TRAMP_FEXIT];
 	struct bpf_tramp_links *fmod_ret = &tlinks[BPF_TRAMP_MODIFY_RETURN];
+	bool is_struct_ops = flags & BPF_TRAMP_F_INDIRECT;
 	bool save_ret;
 	void *orig_call = func_addr;
 
@@ -1784,7 +1812,7 @@ static int __arch_prepare_bpf_trampoline(struct jit_ctx *ctx, struct bpf_tramp_i
 	/* room for args on stack must be at the top of stack */
 	stk_arg_off = stack_size;
 
-	if (func_addr) {
+	if (!is_struct_ops) {
 		/* For the trampoline called from function entry,
 		 * the frame of traced function and the frame of
 		 * trampoline need to be considered.
@@ -1831,7 +1859,7 @@ static int __arch_prepare_bpf_trampoline(struct jit_ctx *ctx, struct bpf_tramp_i
 		orig_call += MCOUNT_INSN_SIZE;
 
 	if (flags & BPF_TRAMP_F_CALL_ORIG) {
-		emit_sw64_ldu64(SW64_BPF_REG_A0, (const u64)im, ctx);
+		emit_sw64_ldu64_addr(SW64_BPF_REG_A0, (const u64)im, ctx);
 		emit_sw64_call((const u64)__bpf_tramp_enter, ctx);
 	}
 
@@ -1875,7 +1903,7 @@ static int __arch_prepare_bpf_trampoline(struct jit_ctx *ctx, struct bpf_tramp_i
 	if (flags & BPF_TRAMP_F_CALL_ORIG) {
 		im->ip_epilogue = ctx->image + ctx->idx;
 		/* for the first pass, assume the worst case */
-		emit_sw64_ldu64(SW64_BPF_REG_A0, (const u64)im, ctx);
+		emit_sw64_ldu64_addr(SW64_BPF_REG_A0, (const u64)im, ctx);
 		emit_sw64_call((const u64)__bpf_tramp_exit, ctx);
 	}
 
@@ -1888,7 +1916,7 @@ static int __arch_prepare_bpf_trampoline(struct jit_ctx *ctx, struct bpf_tramp_i
 	/* callee saved register S0 to transmit start time, so use this reg, now we restore it  */
 	emit(SW64_BPF_LDL(SW64_BPF_REG_S0, SW64_BPF_REG_FP, -sreg_off), ctx);
 
-	if (func_addr) {
+	if (!is_struct_ops) {
 		/* trampoline called from function entry */
 		emit(SW64_BPF_LDL(SW64_BPF_REG_AT, SW64_BPF_REG_SP, stack_size - 8), ctx);
 		emit(SW64_BPF_LDL(SW64_BPF_REG_FP, SW64_BPF_REG_SP, stack_size - 16), ctx);
@@ -1918,6 +1946,30 @@ static int __arch_prepare_bpf_trampoline(struct jit_ctx *ctx, struct bpf_tramp_i
 	kfree(branches);
 
 	return ctx->idx;
+}
+
+int arch_bpf_trampoline_size(const struct btf_func_model *m, u32 flags,
+			     struct bpf_tramp_links *tlinks, void *func_addr)
+{
+	struct bpf_tramp_image im;
+	struct jit_ctx ctx = {
+		.image = NULL,
+		.ro_image = NULL,
+		.sizing = true,
+		.idx = 0,
+	};
+	int ret;
+
+	/* The length of a call and of a descriptor load is only known once the
+	 * address is, so measure with the long form of both. That makes the
+	 * result independent of the addresses the real pass will run with, and
+	 * it is an upper bound since the real pass picks the short forms
+	 * whenever it can.
+	 */
+	ret = __arch_prepare_bpf_trampoline(&ctx, &im, tlinks, func_addr,
+					    btf_func_model_nregs(m), flags);
+
+	return ret < 0 ? ret : ret * SW64_INSN_SIZE;
 }
 
 int arch_prepare_bpf_trampoline(struct bpf_tramp_image *im, void *image, void *image_end,
@@ -2066,7 +2118,11 @@ skip_init_ctx:
 	bpf_flush_icache(header, ctx.image + ctx.idx);
 
 	if (!prog->is_func || extra_pass) {
-		bpf_jit_binary_lock_ro(header);
+		if (bpf_jit_binary_lock_ro(header)) {
+			bpf_jit_binary_free(header);
+			prog = orig_prog;
+			goto out_off;
+		}
 	} else {
 		jit_data->ctx = ctx;
 		jit_data->image = image_ptr;

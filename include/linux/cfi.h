@@ -9,6 +9,14 @@
 
 #include <linux/bug.h>
 #include <linux/module.h>
+#include <asm/cfi.h>
+
+#ifndef cfi_get_offset
+static inline int cfi_get_offset(void)
+{
+	return 0;
+}
+#endif
 
 #ifdef CONFIG_CFI_CLANG
 enum bug_trap_type report_cfi_failure(struct pt_regs *regs, unsigned long addr,

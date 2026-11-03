@@ -1648,7 +1648,7 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 	extable_offset = round_up(prog_size + PLT_TARGET_SIZE, extable_align);
 	image_size = extable_offset + extable_size;
 	header = bpf_jit_binary_alloc(image_size, &image_ptr,
-				      sizeof(u32), jit_fill_hole);
+				      sizeof(u64), jit_fill_hole);
 	if (header == NULL) {
 		prog = orig_prog;
 		goto out_off;
@@ -1697,7 +1697,13 @@ skip_init_ctx:
 			prog->jited_len = 0;
 			goto out_off;
 		}
-		bpf_jit_binary_lock_ro(header);
+		if (bpf_jit_binary_lock_ro(header)) {
+			bpf_jit_binary_free(header);
+			prog->bpf_func = NULL;
+			prog->jited = 0;
+			prog->jited_len = 0;
+			goto out_off;
+		}
 	} else {
 		jit_data->ctx = ctx;
 		jit_data->image = image_ptr;
@@ -2098,18 +2104,10 @@ static int prepare_trampoline(struct jit_ctx *ctx, struct bpf_tramp_image *im,
 	return ctx->idx;
 }
 
-int arch_prepare_bpf_trampoline(struct bpf_tramp_image *im, void *image,
-				void *image_end, const struct btf_func_model *m,
-				u32 flags, struct bpf_tramp_links *tlinks,
-				void *orig_call)
+static int btf_func_model_nregs(const struct btf_func_model *m)
 {
-	int i, ret;
 	int nregs = m->nr_args;
-	int max_insns = ((long)image_end - (long)image) / AARCH64_INSN_SIZE;
-	struct jit_ctx ctx = {
-		.image = NULL,
-		.idx = 0,
-	};
+	int i;
 
 	/* extra registers needed for struct argument */
 	for (i = 0; i < MAX_BPF_FUNC_ARGS; i++) {
@@ -2118,22 +2116,49 @@ int arch_prepare_bpf_trampoline(struct bpf_tramp_image *im, void *image,
 			nregs += (m->arg_size[i] + 7) / 8 - 1;
 	}
 
+	return nregs;
+}
+
+int arch_bpf_trampoline_size(const struct btf_func_model *m, u32 flags,
+			     struct bpf_tramp_links *tlinks, void *func_addr)
+{
+	struct jit_ctx ctx = {
+		.image = NULL,
+		.idx = 0,
+	};
+	struct bpf_tramp_image im;
+	int nregs, ret;
+
+	nregs = btf_func_model_nregs(m);
 	/* the first 8 registers are used for arguments */
 	if (nregs > 8)
 		return -ENOTSUPP;
 
-	ret = prepare_trampoline(&ctx, im, tlinks, orig_call, nregs, flags);
+	ret = prepare_trampoline(&ctx, &im, tlinks, func_addr, nregs, flags);
 	if (ret < 0)
 		return ret;
 
-	if (ret > max_insns)
-		return -EFBIG;
+	return ret < 0 ? ret : ret * AARCH64_INSN_SIZE;
+}
 
-	ctx.image = image;
-	ctx.idx = 0;
+int arch_prepare_bpf_trampoline(struct bpf_tramp_image *im, void *image,
+				void *image_end, const struct btf_func_model *m,
+				u32 flags, struct bpf_tramp_links *tlinks,
+				void *func_addr)
+{
+	int ret, nregs;
+	struct jit_ctx ctx = {
+		.image = image,
+		.idx = 0,
+	};
+
+	nregs = btf_func_model_nregs(m);
+	/* the first 8 registers are used for arguments */
+	if (nregs > 8)
+		return -ENOTSUPP;
 
 	jit_fill_hole(image, (unsigned int)(image_end - image));
-	ret = prepare_trampoline(&ctx, im, tlinks, orig_call, nregs, flags);
+	ret = prepare_trampoline(&ctx, im, tlinks, func_addr, nregs, flags);
 
 	if (ret > 0 && validate_code(&ctx) < 0)
 		ret = -EINVAL;
@@ -2357,4 +2382,9 @@ out:
 	mutex_unlock(&text_mutex);
 
 	return ret;
+}
+
+bool bpf_jit_supports_ptr_xchg(void)
+{
+	return true;
 }

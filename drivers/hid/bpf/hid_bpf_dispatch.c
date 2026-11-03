@@ -18,6 +18,7 @@
 #include <linux/minmax.h>
 #include <linux/module.h>
 #include <linux/workqueue.h>
+#include <linux/overflow.h>
 #include "hid_bpf_dispatch.h"
 #include "entrypoints/entrypoints.lskel.h"
 
@@ -157,13 +158,15 @@ noinline __u8 *
 hid_bpf_get_data(struct hid_bpf_ctx *ctx, unsigned int offset, const size_t rdwr_buf_size)
 {
 	struct hid_bpf_ctx_kern *ctx_kern;
+	size_t end;
 
 	if (!ctx)
 		return NULL;
 
 	ctx_kern = container_of(ctx, struct hid_bpf_ctx_kern, ctx);
 
-	if (rdwr_buf_size + offset > ctx->allocated_size)
+	if (check_add_overflow(rdwr_buf_size, offset, &end) ||
+	    end > ctx->allocated_size)
 		return NULL;
 
 	return ctx_kern->data + offset;
@@ -173,9 +176,9 @@ hid_bpf_get_data(struct hid_bpf_ctx *ctx, unsigned int offset, const size_t rdwr
  * The following set contains all functions we agree BPF programs
  * can use.
  */
-BTF_SET8_START(hid_bpf_kfunc_ids)
+BTF_KFUNCS_START(hid_bpf_kfunc_ids)
 BTF_ID_FLAGS(func, hid_bpf_get_data, KF_RET_NULL)
-BTF_SET8_END(hid_bpf_kfunc_ids)
+BTF_KFUNCS_END(hid_bpf_kfunc_ids)
 
 static const struct btf_kfunc_id_set hid_bpf_kfunc_set = {
 	.owner = THIS_MODULE,
@@ -480,12 +483,12 @@ static const struct btf_kfunc_id_set hid_bpf_fmodret_set = {
 };
 
 /* for syscall HID-BPF */
-BTF_SET8_START(hid_bpf_syscall_kfunc_ids)
+BTF_KFUNCS_START(hid_bpf_syscall_kfunc_ids)
 BTF_ID_FLAGS(func, hid_bpf_attach_prog)
 BTF_ID_FLAGS(func, hid_bpf_allocate_context, KF_ACQUIRE | KF_RET_NULL)
 BTF_ID_FLAGS(func, hid_bpf_release_context, KF_RELEASE)
 BTF_ID_FLAGS(func, hid_bpf_hw_request)
-BTF_SET8_END(hid_bpf_syscall_kfunc_ids)
+BTF_KFUNCS_END(hid_bpf_syscall_kfunc_ids)
 
 static const struct btf_kfunc_id_set hid_bpf_syscall_kfunc_set = {
 	.owner = THIS_MODULE,
