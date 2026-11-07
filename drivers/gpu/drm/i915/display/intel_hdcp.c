@@ -165,15 +165,17 @@ bool intel_hdcp_capable(struct intel_connector *connector)
 	return capable;
 }
 
-/* Is HDCP2.2 capable on Platform and Sink */
-bool intel_hdcp2_capable(struct intel_connector *connector)
+/*
+ * Check if the source has all the building blocks ready to make
+ * HDCP 2.2 work
+ */
+static bool intel_hdcp2_prerequisite(struct intel_connector *connector)
 {
 	struct drm_i915_private *i915 = to_i915(connector->base.dev);
 	struct intel_hdcp *hdcp = &connector->hdcp;
-	bool capable = false;
 
 	if (!intel_attached_encoder(connector))
-		return capable;
+		return false;
 
 	/* I915 support for HDCP2.2 */
 	if (!hdcp->hdcp2_supported)
@@ -181,14 +183,8 @@ bool intel_hdcp2_capable(struct intel_connector *connector)
 
 	/* If MTL+ make sure gsc is loaded and proxy is setup */
 	if (intel_hdcp_gsc_cs_required(i915)) {
-		struct intel_gt *gt = i915->media_gt;
-		struct intel_gsc_uc *gsc = gt ? &gt->uc.gsc : NULL;
-
-		if (!gsc || !intel_uc_fw_is_running(&gsc->fw)) {
-			drm_dbg_kms(&i915->drm,
-				    "GSC components required for HDCP2.2 are not ready\n");
+		if (!intel_hdcp_gsc_check_status(i915))
 			return false;
-		}
 	}
 
 	/* MEI/GSC interface is solid depending on which is used */
@@ -198,6 +194,18 @@ bool intel_hdcp2_capable(struct intel_connector *connector)
 		return false;
 	}
 	mutex_unlock(&i915->display.hdcp.hdcp_mutex);
+
+	return true;
+}
+
+/* Is HDCP2.2 capable on Platform and Sink */
+bool intel_hdcp2_capable(struct intel_connector *connector)
+{
+	struct intel_hdcp *hdcp = &connector->hdcp;
+	bool capable = false;
+
+	if (!intel_hdcp2_prerequisite(connector))
+		return false;
 
 	/* Sink's capability for HDCP2.2 */
 	hdcp->shim->hdcp_2_2_capable(connector, &capable);
@@ -361,7 +369,7 @@ u32 intel_hdcp_get_repeater_ctl(struct drm_i915_private *i915,
 		default:
 			drm_err(&i915->drm, "Unknown transcoder %d\n",
 				cpu_transcoder);
-			return -EINVAL;
+			return 0;
 		}
 	}
 
@@ -378,7 +386,7 @@ u32 intel_hdcp_get_repeater_ctl(struct drm_i915_private *i915,
 		return HDCP_DDIE_REP_PRESENT | HDCP_DDIE_SHA1_M0;
 	default:
 		drm_err(&i915->drm, "Unknown port %d\n", port);
-		return -EINVAL;
+		return 0;
 	}
 }
 
@@ -937,7 +945,7 @@ static int _intel_hdcp_disable(struct intel_connector *connector)
 	return 0;
 }
 
-static int _intel_hdcp_enable(struct intel_connector *connector)
+static int intel_hdcp1_enable(struct intel_connector *connector)
 {
 	struct drm_i915_private *i915 = to_i915(connector->base.dev);
 	struct intel_hdcp *hdcp = &connector->hdcp;
@@ -1073,7 +1081,7 @@ static int intel_hdcp_check_link(struct intel_connector *connector)
 		goto out;
 	}
 
-	ret = _intel_hdcp_enable(connector);
+	ret = intel_hdcp1_enable(connector);
 	if (ret) {
 		drm_err(&i915->drm, "Failed to enable hdcp (%d)\n", ret);
 		intel_hdcp_update_value(connector,
@@ -2048,13 +2056,15 @@ static int intel_hdcp2_check_link(struct intel_connector *connector)
 
 		drm_dbg_kms(&i915->drm,
 			    "HDCP2.2 Downstream topology change\n");
+
 		ret = hdcp2_authenticate_repeater_topology(connector);
 		if (!ret) {
 			intel_hdcp_update_value(connector,
-					DRM_MODE_CONTENT_PROTECTION_ENABLED,
-					true);
+						DRM_MODE_CONTENT_PROTECTION_ENABLED,
+						true);
 			goto out;
 		}
+
 		drm_dbg_kms(&i915->drm,
 			    "[%s:%d] Repeater topology auth failed.(%d)\n",
 			    connector->base.name, connector->base.base.id,
@@ -2075,18 +2085,8 @@ static int intel_hdcp2_check_link(struct intel_connector *connector)
 		goto out;
 	}
 
-	ret = _intel_hdcp2_enable(connector);
-	if (ret) {
-		drm_dbg_kms(&i915->drm,
-			    "[%s:%d] Failed to enable hdcp2.2 (%d)\n",
-			    connector->base.name, connector->base.base.id,
-			    ret);
-		intel_hdcp_update_value(connector,
-					DRM_MODE_CONTENT_PROTECTION_DESIRED,
-					true);
-		goto out;
-	}
-
+	intel_hdcp_update_value(connector,
+				DRM_MODE_CONTENT_PROTECTION_DESIRED, true);
 out:
 	mutex_unlock(&dig_port->hdcp_mutex);
 	mutex_unlock(&hdcp->mutex);
@@ -2343,10 +2343,10 @@ intel_hdcp_set_streams(struct intel_digital_port *dig_port,
 	return 0;
 }
 
-int intel_hdcp_enable(struct intel_atomic_state *state,
-		      struct intel_encoder *encoder,
-		      const struct intel_crtc_state *pipe_config,
-		      const struct drm_connector_state *conn_state)
+static int _intel_hdcp_enable(struct intel_atomic_state *state,
+			      struct intel_encoder *encoder,
+			      const struct intel_crtc_state *pipe_config,
+			      const struct drm_connector_state *conn_state)
 {
 	struct drm_i915_private *i915 = to_i915(encoder->base.dev);
 	struct intel_connector *connector =
@@ -2407,7 +2407,7 @@ int intel_hdcp_enable(struct intel_atomic_state *state,
 	 */
 	if (ret && intel_hdcp_capable(connector) &&
 	    hdcp->content_type != DRM_MODE_HDCP_CONTENT_TYPE1) {
-		ret = _intel_hdcp_enable(connector);
+		ret = intel_hdcp1_enable(connector);
 	}
 
 	if (!ret) {
@@ -2421,6 +2421,27 @@ int intel_hdcp_enable(struct intel_atomic_state *state,
 	mutex_unlock(&dig_port->hdcp_mutex);
 	mutex_unlock(&hdcp->mutex);
 	return ret;
+}
+
+void intel_hdcp_enable(struct intel_atomic_state *state,
+		       struct intel_encoder *encoder,
+		       const struct intel_crtc_state *crtc_state,
+		       const struct drm_connector_state *conn_state)
+{
+	struct intel_connector *connector =
+		to_intel_connector(conn_state->connector);
+	struct intel_hdcp *hdcp = &connector->hdcp;
+
+	/*
+	 * Enable hdcp if it's desired or if userspace is enabled and
+	 * driver set its state to undesired
+	 */
+	if (conn_state->content_protection ==
+	    DRM_MODE_CONTENT_PROTECTION_DESIRED ||
+	    (conn_state->content_protection ==
+	    DRM_MODE_CONTENT_PROTECTION_ENABLED && hdcp->value ==
+	    DRM_MODE_CONTENT_PROTECTION_UNDESIRED))
+		_intel_hdcp_enable(state, encoder, crtc_state, conn_state);
 }
 
 int intel_hdcp_disable(struct intel_connector *connector)
@@ -2513,7 +2534,7 @@ void intel_hdcp_update_pipe(struct intel_atomic_state *state,
 	}
 
 	if (desired_and_not_enabled || content_protection_type_changed)
-		intel_hdcp_enable(state, encoder, crtc_state, conn_state);
+		_intel_hdcp_enable(state, encoder, crtc_state, conn_state);
 }
 
 void intel_hdcp_component_fini(struct drm_i915_private *i915)

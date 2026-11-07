@@ -32,12 +32,15 @@
 #include "intel_cdclk.h"
 #include "intel_crtc.h"
 #include "intel_de.h"
+#include "intel_dp.h"
 #include "intel_display_types.h"
 #include "intel_mchbar_regs.h"
 #include "intel_pci_config.h"
 #include "intel_pcode.h"
 #include "intel_psr.h"
 #include "intel_vdsc.h"
+#include "skl_watermark.h"
+#include "skl_watermark_regs.h"
 #include "vlv_sideband.h"
 
 /**
@@ -1580,6 +1583,8 @@ static void bxt_get_cdclk(struct drm_i915_private *dev_priv,
 	}
 
  out:
+	if (DISPLAY_VER(dev_priv) >= 20)
+		cdclk_config->joined_mbus = intel_de_read(dev_priv, MBUS_CTL) & MBUS_JOIN;
 	/*
 	 * Can't read this out :( Let's assume it's
 	 * at least what the CDCLK frequency requires.
@@ -1779,6 +1784,29 @@ static int cdclk_squash_divider(u16 waveform)
 	return hweight16(waveform ?: 0xffff);
 }
 
+static bool mdclk_source_is_cdclk_pll(struct drm_i915_private *i915)
+{
+	return DISPLAY_VER(i915) >= 20;
+}
+
+int intel_mdclk_cdclk_ratio(struct drm_i915_private *i915,
+			    const struct intel_cdclk_config *cdclk_config)
+{
+	if (mdclk_source_is_cdclk_pll(i915))
+		return DIV_ROUND_UP(cdclk_config->vco, cdclk_config->cdclk);
+
+	/* Otherwise, source for MDCLK is CD2XCLK. */
+	return 2;
+}
+
+static void xe2lpd_mdclk_cdclk_ratio_program(struct drm_i915_private *i915,
+					     const struct intel_cdclk_config *cdclk_config)
+{
+	intel_dbuf_mdclk_cdclk_ratio_update(i915,
+					    intel_mdclk_cdclk_ratio(i915, cdclk_config),
+					    cdclk_config->joined_mbus);
+}
+
 static bool cdclk_compute_crawl_and_squash_midpoint(struct drm_i915_private *i915,
 						    const struct intel_cdclk_config *old_cdclk_config,
 						    const struct intel_cdclk_config *new_cdclk_config,
@@ -1932,6 +1960,9 @@ static void bxt_set_cdclk(struct drm_i915_private *dev_priv,
 		return;
 	}
 
+	if (DISPLAY_VER(dev_priv) >= 20 && cdclk < dev_priv->display.cdclk.hw.cdclk)
+		xe2lpd_mdclk_cdclk_ratio_program(dev_priv, cdclk_config);
+
 	if (cdclk_compute_crawl_and_squash_midpoint(dev_priv, &dev_priv->display.cdclk.hw,
 						    cdclk_config, &mid_cdclk_config)) {
 		_bxt_set_cdclk(dev_priv, &mid_cdclk_config, pipe);
@@ -1939,6 +1970,9 @@ static void bxt_set_cdclk(struct drm_i915_private *dev_priv,
 	} else {
 		_bxt_set_cdclk(dev_priv, cdclk_config, pipe);
 	}
+
+	if (DISPLAY_VER(dev_priv) >= 20 && cdclk > dev_priv->display.cdclk.hw.cdclk)
+		xe2lpd_mdclk_cdclk_ratio_program(dev_priv, cdclk_config);
 
 	if (DISPLAY_VER(dev_priv) >= 14)
 		/*
@@ -2438,6 +2472,17 @@ static void intel_cdclk_pcode_post_notify(struct intel_atomic_state *state)
 			   update_cdclk, update_pipe_count);
 }
 
+bool intel_cdclk_is_decreasing_later(struct intel_atomic_state *state)
+{
+	const struct intel_cdclk_state *old_cdclk_state =
+		intel_atomic_get_old_cdclk_state(state);
+	const struct intel_cdclk_state *new_cdclk_state =
+		intel_atomic_get_new_cdclk_state(state);
+
+	return new_cdclk_state && !new_cdclk_state->disable_pipes &&
+		new_cdclk_state->actual.cdclk < old_cdclk_state->actual.cdclk;
+}
+
 /**
  * intel_set_cdclk_pre_plane_update - Push the CDCLK state to the hardware
  * @state: intel atomic state
@@ -2478,6 +2523,12 @@ intel_set_cdclk_pre_plane_update(struct intel_atomic_state *state)
 		cdclk_config.voltage_level = max(new_cdclk_state->actual.voltage_level,
 						 old_cdclk_state->actual.voltage_level);
 	}
+
+	/*
+	 * mbus joining will be changed later by
+	 * intel_dbuf_mbus_{pre,post}_ddb_update()
+	 */
+	cdclk_config.joined_mbus = old_cdclk_state->actual.joined_mbus;
 
 	drm_WARN_ON(&i915->drm, !new_cdclk_state->base.changed);
 
@@ -2546,6 +2597,49 @@ static int intel_planes_min_cdclk(const struct intel_crtc_state *crtc_state)
 
 	for_each_intel_plane_on_crtc(&dev_priv->drm, crtc, plane)
 		min_cdclk = max(crtc_state->min_cdclk[plane->id], min_cdclk);
+
+	return min_cdclk;
+}
+
+static int intel_vdsc_min_cdclk(const struct intel_crtc_state *crtc_state)
+{
+	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
+	struct drm_i915_private *i915 = to_i915(crtc->base.dev);
+	int num_vdsc_instances = intel_dsc_get_num_vdsc_instances(crtc_state);
+	int min_cdclk = 0;
+
+	/*
+	 * When we decide to use only one VDSC engine, since
+	 * each VDSC operates with 1 ppc throughput, pixel clock
+	 * cannot be higher than the VDSC clock (cdclk)
+	 * If there 2 VDSC engines, then pixel clock can't be higher than
+	 * VDSC clock(cdclk) * 2 and so on.
+	 */
+	min_cdclk = max_t(int, min_cdclk,
+			  DIV_ROUND_UP(crtc_state->pixel_rate, num_vdsc_instances));
+
+	if (crtc_state->bigjoiner_pipes) {
+		int pixel_clock = intel_dp_mode_to_fec_clock(crtc_state->hw.adjusted_mode.clock);
+
+		/*
+		 * According to Bigjoiner bw check:
+		 * compressed_bpp <= PPC * CDCLK * Big joiner Interface bits / Pixel clock
+		 *
+		 * We have already computed compressed_bpp, so now compute the min CDCLK that
+		 * is required to support this compressed_bpp.
+		 *
+		 * => CDCLK >= compressed_bpp * Pixel clock / (PPC * Bigjoiner Interface bits)
+		 *
+		 * Since PPC = 2 with bigjoiner
+		 * => CDCLK >= compressed_bpp * Pixel clock  / 2 * Bigjoiner Interface bits
+		 */
+		int bigjoiner_interface_bits = DISPLAY_VER(i915) > 13 ? 36 : 24;
+		int min_cdclk_bj =
+			(to_bpp_int_roundup(crtc_state->dsc.compressed_bpp_x16) *
+			 pixel_clock) / (2 * bigjoiner_interface_bits);
+
+		min_cdclk = max(min_cdclk, min_cdclk_bj);
+	}
 
 	return min_cdclk;
 }
@@ -2621,20 +2715,8 @@ int intel_crtc_compute_min_cdclk(const struct intel_crtc_state *crtc_state)
 	/* Account for additional needs from the planes */
 	min_cdclk = max(intel_planes_min_cdclk(crtc_state), min_cdclk);
 
-	/*
-	 * When we decide to use only one VDSC engine, since
-	 * each VDSC operates with 1 ppc throughput, pixel clock
-	 * cannot be higher than the VDSC clock (cdclk)
-	 * If there 2 VDSC engines, then pixel clock can't be higher than
-	 * VDSC clock(cdclk) * 2 and so on.
-	 */
-	if (crtc_state->dsc.compression_enable) {
-		int num_vdsc_instances = intel_dsc_get_num_vdsc_instances(crtc_state);
-
-		min_cdclk = max_t(int, min_cdclk,
-				  DIV_ROUND_UP(crtc_state->pixel_rate,
-					       num_vdsc_instances));
-	}
+	if (crtc_state->dsc.compression_enable)
+		min_cdclk = max(min_cdclk, intel_vdsc_min_cdclk(crtc_state));
 
 	/*
 	 * HACK. Currently for TGL/DG2 platforms we calculate
@@ -3027,6 +3109,20 @@ int intel_cdclk_atomic_check(struct intel_atomic_state *state,
 	return 0;
 }
 
+int intel_cdclk_state_set_joined_mbus(struct intel_atomic_state *state, bool joined_mbus)
+{
+	struct intel_cdclk_state *cdclk_state;
+
+	cdclk_state = intel_atomic_get_cdclk_state(state);
+	if (IS_ERR(cdclk_state))
+		return PTR_ERR(cdclk_state);
+
+	cdclk_state->actual.joined_mbus = joined_mbus;
+	cdclk_state->logical.joined_mbus = joined_mbus;
+
+	return intel_atomic_lock_global_state(&cdclk_state->base);
+}
+
 int intel_cdclk_init(struct drm_i915_private *dev_priv)
 {
 	struct intel_cdclk_state *cdclk_state;
@@ -3146,6 +3242,15 @@ int intel_modeset_calc_cdclk(struct intel_atomic_state *state)
 
 		drm_dbg_kms(&dev_priv->drm,
 			    "Modeset required for cdclk change\n");
+	}
+
+	if (intel_mdclk_cdclk_ratio(dev_priv, &old_cdclk_state->actual) !=
+	    intel_mdclk_cdclk_ratio(dev_priv, &new_cdclk_state->actual)) {
+		int ratio = intel_mdclk_cdclk_ratio(dev_priv, &new_cdclk_state->actual);
+
+		ret = intel_dbuf_state_set_mdclk_cdclk_ratio(state, ratio);
+		if (ret)
+			return ret;
 	}
 
 	drm_dbg_kms(&dev_priv->drm,

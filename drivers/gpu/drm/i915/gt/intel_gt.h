@@ -87,7 +87,12 @@ static inline bool gt_is_root(struct intel_gt *gt)
 	return !gt->info.id;
 }
 
+bool intel_gt_needs_wa_16018031267(struct intel_gt *gt);
 bool intel_gt_needs_wa_22016122933(struct intel_gt *gt);
+
+#define NEEDS_FASTCOLOR_BLT_WABB(engine) ( \
+	intel_gt_needs_wa_16018031267(engine->gt) && \
+	engine->class == COPY_ENGINE_CLASS && engine->instance == 0)
 
 static inline struct intel_gt *uc_to_gt(struct intel_uc *uc)
 {
@@ -179,4 +184,10 @@ enum i915_map_type intel_gt_coherent_map_type(struct intel_gt *gt,
 void intel_gt_bind_context_set_ready(struct intel_gt *gt);
 void intel_gt_bind_context_set_unready(struct intel_gt *gt);
 bool intel_gt_is_bind_context_ready(struct intel_gt *gt);
+
+static inline void intel_gt_set_wedged_async(struct intel_gt *gt)
+{
+	queue_work(system_highpri_wq, &gt->wedge);
+}
+
 #endif /* __INTEL_GT_H__ */
