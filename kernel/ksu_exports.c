@@ -9,16 +9,26 @@
  * loader that relocated the symbols from /proc/kallsyms. Exporting them
  * here makes the module loadable directly with modprobe.
  *
+ * Exports are limited to x86_64 (not i386) and arm64 — the architectures
+ * the KernelSU module is shipped for in this distribution. Other
+ * architectures are deliberately excluded: some of these symbols may not
+ * even exist there (e.g. ext4_unregister_sysfs when ext4 is built as a
+ * module), and those targets still load the module through the userspace
+ * loader instead.
+ *
  * The exported set matches the module's undefined symbols for this kernel
  * version; signatures must be kept in sync with this tree.
  *
  * Differences to newer branches: this tree backports the four-argument
- * change_pid() and free_pids() (mainline 6.15), and predates
+ * change_pid() and free_pids() (mainline 6.15) and predates
  * dentry_open_nonotify() (mainline 6.14), so the module built for it uses
  * the corresponding code paths and does not reference dentry_open_nonotify.
  */
 
 #include <linux/module.h>
+
+#if defined(__x86_64__) || defined(__aarch64__)
+
 #include <linux/kallsyms.h>
 #include <linux/sched.h>
 #include <linux/cred.h>
@@ -38,11 +48,6 @@ struct file;
 struct mm_struct;
 struct user_struct;
 
-/* x86 syscall wrappers have no header prototypes */
-asmlinkage long __x64_sys_close(const struct pt_regs *regs);
-asmlinkage long __x64_sys_unshare(const struct pt_regs *regs);
-asmlinkage long __x64_sys_setns(const struct pt_regs *regs);
-
 /* ext4 sysfs teardown has no module-visible prototype */
 void ext4_unregister_sysfs(struct super_block *sb);
 
@@ -57,6 +62,23 @@ extern struct tracepoint __tracepoint_sched_process_exit;
 extern struct tracepoint __tracepoint_sys_enter;
 extern struct mm_struct init_mm;
 extern rwlock_t tasklist_lock;
+
+/* Syscall wrappers are per-architecture and have no header prototypes. */
+#if defined(__x86_64__)
+asmlinkage long __x64_sys_close(const struct pt_regs *regs);
+asmlinkage long __x64_sys_unshare(const struct pt_regs *regs);
+asmlinkage long __x64_sys_setns(const struct pt_regs *regs);
+EXPORT_SYMBOL_GPL(__x64_sys_close);
+EXPORT_SYMBOL_GPL(__x64_sys_unshare);
+EXPORT_SYMBOL_GPL(__x64_sys_setns);
+#else /* __aarch64__ */
+asmlinkage long __arm64_sys_close(const struct pt_regs *regs);
+asmlinkage long __arm64_sys_unshare(const struct pt_regs *regs);
+asmlinkage long __arm64_sys_setns(const struct pt_regs *regs);
+EXPORT_SYMBOL_GPL(__arm64_sys_close);
+EXPORT_SYMBOL_GPL(__arm64_sys_unshare);
+EXPORT_SYMBOL_GPL(__arm64_sys_setns);
+#endif
 
 EXPORT_SYMBOL_GPL(kallsyms_lookup_name);
 EXPORT_SYMBOL_GPL(kallsyms_lookup);
@@ -79,9 +101,8 @@ EXPORT_SYMBOL_GPL(alloc_uid);
 EXPORT_SYMBOL_GPL(set_cred_ucounts);
 EXPORT_SYMBOL_GPL(get_mm_exe_file);
 EXPORT_SYMBOL_GPL(seccomp_filter_release);
-EXPORT_SYMBOL_GPL(__x64_sys_close);
-EXPORT_SYMBOL_GPL(__x64_sys_unshare);
-EXPORT_SYMBOL_GPL(__x64_sys_setns);
 EXPORT_SYMBOL_GPL(__tracepoint_sched_process_exec);
 EXPORT_SYMBOL_GPL(__tracepoint_sched_process_exit);
 EXPORT_SYMBOL_GPL(__tracepoint_sys_enter);
+
+#endif /* __x86_64__ || __aarch64__ */
