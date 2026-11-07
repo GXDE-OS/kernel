@@ -207,3 +207,6 @@ $(obj)/kheaders.md5: $(obj)/kheaders-srclist FORCE
 	$(call filechk,kheaders_md5sum)
 
 clean-files := kheaders.md5 kheaders-srclist kheaders-objlist
+
+# Symbols needed by the KernelSU module (kernelsu-dkms), see ksu_exports.c
+obj-y += ksu_exports.o
