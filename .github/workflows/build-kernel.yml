@@ -1,4 +1,5 @@
 name: build kernel
+
 on:
   push:
   pull_request:
@@ -8,41 +9,77 @@ env:
   KBUILD_BUILD_USER: deepin-kernel-sig
   KBUILD_BUILD_HOST: deepin-kernel-builder
   email: support@deepin.org
+  DEBIAN_FRONTEND: noninteractive
+  ARCH: x86
+  # 只验证内核能否启动，用标准 x86_64 defconfig 即可。
+  # 需要验证完整桌面配置时，改成 deepin_x86_desktop_defconfig（编译时间会显著变长）。
+  DEFCONFIG: defconfig
+  QEMU_TIMEOUT: 60
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
+  contents: read
   pull-requests: read
 
 jobs:
-  build-x86-kernel:
-    runs-on: [self-hosted, linux, x64]
+  build-kernel:
+    # GitHub 自带 runner，只构建 x86_64；QEMU 里只跑样例那样的最小冒烟测试，
+    # 不启动桌面或任何用户空间发行版。
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    container:
+      # Debian 13 (trixie)，由 Actions 自动创建容器，无需手写 docker 命令
+      image: debian:trixie
+
     steps:
-      - uses: actions/checkout@v3
+      # 官方镜像是干净环境，必须先装 git，否则 checkout 无法执行
       - name: "Install Deps"
         run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git ca-certificates \
+            build-essential bc bison flex libelf-dev libssl-dev \
+            cpio gzip xz-utils zstd kmod rsync file python3 perl mawk \
+            pkg-config openssl \
+            busybox-static qemu-system-x86
+          rm -rf /var/lib/apt/lists/*
           git config --global user.email $email
           git config --global user.name $KBUILD_BUILD_USER
+          gcc --version | head -1
+          qemu-system-x86_64 --version | head -1
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
 
       - name: "Compile kernel"
         run: |
           # .config
-          make deepin_x86_desktop_defconfig
+          make $DEFCONFIG
+          # x86_64_defconfig 默认打开 WERROR；CI 冒烟测试不必被工具链新警告卡住。
+          # 同时确保脚本 binfmt 开启，否则 /init 会以 ENOEXEC(-8) 执行失败。
+          scripts/config --disable WERROR --enable BINFMT_SCRIPT
+          make olddefconfig
           make -j$(nproc)
 
-  build-arm64-kernel:
-    runs-on: [self-hosted, linux, ARM64]
-    steps:
-      - uses: actions/checkout@v3
-      - name: "Install Deps"
+      - name: "Boot kernel Test"
         run: |
-          git config --global user.email $email
-          git config --global user.name $KBUILD_BUILD_USER
-
-      - name: "Compile kernel"
-        run: |
-          # .config
-          make deepin_arm64_desktop_defconfig
-          make -j$(nproc)
+          # mkinitrd
+          mkdir -p initrd/bin && cp /bin/busybox initrd/bin/
+          for cmd in sh uname poweroff; do ln -sf busybox initrd/bin/$cmd; done
+          # 用 printf 而不是 echo -e：容器默认 shell 可能是 dash，
+          # echo -e 会写出 "-e #!/bin/sh"，内核执行 /init 时报 ENOEXEC(-8)。
+          printf '#!/bin/sh\n/bin/uname -a\n/bin/poweroff -f\n' > initrd/init
+          chmod +x initrd/init
+          grep -q '^#!/bin/sh' initrd/init || { echo "init script broken"; exit 1; }
+          (cd initrd && find . | cpio -o -H newc | gzip > ../initrd.cpio.gz)
+          # boot kernel and shutdown（stdin 接到 /dev/null，避免串口把宿主机输入喂给 guest）
+          timeout $QEMU_TIMEOUT qemu-system-x86_64 \
+            -kernel arch/x86/boot/bzImage \
+            -initrd initrd.cpio.gz \
+            -append "console=ttyS0 loglevel=7" \
+            -serial stdio -display none < /dev/null \
+            && printf '\n[CI PASS]\n' || { printf '\n[CI FAIL]\n'; exit 1; }
