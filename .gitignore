@@ -11,6 +11,8 @@
 # Normal rules (sorted alphabetically)
 #
 .*
+# Allow GitHub Actions workflows (the rule above ignores dot-directories)
+!.github/
 *.a
 *.asn1.[ch]
 *.bc
