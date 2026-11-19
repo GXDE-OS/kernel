@@ -103,7 +103,6 @@ EXPORT_SYMBOL_GPL(alloc_uid);
 EXPORT_SYMBOL_GPL(set_cred_ucounts);
 EXPORT_SYMBOL_GPL(get_mm_exe_file);
 EXPORT_SYMBOL_GPL(seccomp_filter_release);
-EXPORT_SYMBOL_GPL(dentry_open_nonotify);
 EXPORT_SYMBOL_GPL(__tracepoint_sched_process_exec);
 EXPORT_SYMBOL_GPL(__tracepoint_sched_process_exit);
 EXPORT_SYMBOL_GPL(__tracepoint_sys_enter);
