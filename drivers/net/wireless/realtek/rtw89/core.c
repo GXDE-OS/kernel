@@ -1231,7 +1231,7 @@ static void rtw89_core_tx_update_injection(struct rtw89_dev *rtwdev,
 	enum mac80211_rate_control_flags flags = info->control.rates[0].flags;
 	struct rtw89_tx_desc_info *desc_info = &tx_req->desc_info;
 	const struct rtw89_chan *chan;
-	u8 idx = info->control.rates[0].idx;
+	u8 idx = max_t(s8, info->control.rates[0].idx, 0);
 	u8 nss, mcs;
 
 	desc_info->use_rate = true;
@@ -1289,7 +1289,11 @@ rtw89_core_tx_update_desc_info(struct rtw89_dev *rtwdev,
 	else if (tx_req->vif)
 		desc_info->mlo = ieee80211_vif_is_mld(tx_req->vif);
 
-	seq = (le16_to_cpu(hdr->seq_ctrl) & IEEE80211_SCTL_SEQ) >> 4;
+	if (ieee80211_is_ctl(hdr->frame_control))
+		seq = 0;
+	else
+		seq = (le16_to_cpu(hdr->seq_ctrl) & IEEE80211_SCTL_SEQ) >> 4;
+
 	addr_cam = rtw89_get_addr_cam_of(tx_req->rtwvif_link,
 					 tx_req->rtwsta_link);
 	if (addr_cam->valid && desc_info->mlo)
@@ -3825,6 +3829,7 @@ static void rtw89_core_update_rx_freq_from_ie(struct rtw89_dev *rtwdev,
 {
 	struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt *)skb->data;
 	size_t hdr_len, ielen;
+	enum rtw89_band tmp;
 	u8 *variable;
 	int chan;
 
@@ -3858,7 +3863,8 @@ static void rtw89_core_update_rx_freq_from_ie(struct rtw89_dev *rtwdev,
 	if (chan == -1)
 		return;
 
-	rx_status->band = chan > 14 ? RTW89_BAND_5G : RTW89_BAND_2G;
+	tmp = chan > 14 ? RTW89_BAND_5G : RTW89_BAND_2G;
+	rx_status->band = rtw89_hw_to_nl80211_band(tmp);
 	rx_status->freq = ieee80211_channel_to_frequency(chan, rx_status->band);
 }
 
@@ -3960,7 +3966,8 @@ static bool rtw89_core_skb_pn_valid(struct rtw89_dev *rtwdev,
 	if (!ieee80211_is_data_qos(hdr->frame_control))
 		return true;
 
-	if (!desc_info->hw_dec || !desc_info->addr1_match)
+	if (!desc_info->hw_dec || !desc_info->addr1_match ||
+	    desc_info->sw_dec || desc_info->icv_err || desc_info->crc32_err)
 		return true;
 
 	guard(rcu)();
@@ -7705,6 +7712,7 @@ struct rtw89_dev *rtw89_alloc_ieee80211_hw(struct device *device,
 	rtwdev->board = info->board;
 	rtwdev->fw.req.firmware = firmware;
 	rtwdev->fw.fw_format = fw_format;
+	rtwdev->support_chanctx = !no_chanctx;
 	rtwdev->support_mlo = support_mlo;
 
 	bitmap_or(rtwdev->quirks, rtwdev->quirks, dev_id_quirks,

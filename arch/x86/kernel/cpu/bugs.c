@@ -1176,9 +1176,9 @@ enum srso_mitigation {
 	SRSO_MITIGATION_IBPB,
 	SRSO_MITIGATION_IBPB_ON_VMEXIT,
 	SRSO_MITIGATION_BP_SPEC_REDUCE,
+	SRSO_MITIGATION_USER_IBPB,
 	SRSO_MITIGATION_EIBRS,
 	SRSO_MITIGATION_EIBRS_UCODE_NEEDED,
-	SRSO_MITIGATION_USER_IBPB,
 };
 
 static enum srso_mitigation srso_mitigation __ro_after_init = SRSO_MITIGATION_AUTO;
@@ -2969,9 +2969,9 @@ static const char * const srso_strings[] = {
 	[SRSO_MITIGATION_IBPB]			= "Mitigation: IBPB",
 	[SRSO_MITIGATION_IBPB_ON_VMEXIT]	= "Mitigation: IBPB on VMEXIT only",
 	[SRSO_MITIGATION_BP_SPEC_REDUCE]	= "Mitigation: Reduced Speculation",
+	[SRSO_MITIGATION_USER_IBPB]		= "Mitigation: IBPB on context switch",
 	[SRSO_MITIGATION_EIBRS]			= "Mitigation: Enhanced IBRS",
 	[SRSO_MITIGATION_EIBRS_UCODE_NEEDED]	= "Vulnerable: Enhanced IBRS, no microcode",
-	[SRSO_MITIGATION_USER_IBPB]		= "Mitigation: IBPB on context switch",
 };
 
 static int __init srso_parse_cmdline(char *str)

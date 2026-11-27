@@ -23,10 +23,15 @@ static void rtw89_ops_tx(struct ieee80211_hw *hw,
 	struct rtw89_dev *rtwdev = hw->priv;
 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
 	struct ieee80211_vif *vif = info->control.vif;
-	struct rtw89_vif *rtwvif = vif_to_rtwvif(vif);
+	struct rtw89_vif *rtwvif = vif_to_rtwvif_safe(vif);
 	struct ieee80211_sta *sta = control->sta;
 	u32 flags = IEEE80211_SKB_CB(skb)->flags;
 	int ret, qsel;
+
+	if (unlikely(!rtwvif)) {
+		ieee80211_free_txskb(hw, skb);
+		return;
+	}
 
 	if (rtwvif->offchan && !(flags & IEEE80211_TX_CTL_TX_OFFCHAN) && sta) {
 		struct rtw89_sta *rtwsta = sta_to_rtwsta(sta);
@@ -82,6 +87,13 @@ static int rtw89_ops_config(struct ieee80211_hw *hw, int radio_idx, u32 changed)
 	wiphy_work_cancel(hw->wiphy, &rtwdev->ips_work);
 
 	rtw89_leave_ps_mode(rtwdev);
+
+	if (!rtwdev->support_chanctx &&
+	    changed & IEEE80211_CONF_CHANGE_IDLE &&
+	    changed & IEEE80211_CONF_CHANGE_MONITOR &&
+	    !(hw->conf.flags & IEEE80211_CONF_IDLE) &&
+	    hw->conf.flags & IEEE80211_CONF_MONITOR)
+		changed |= IEEE80211_CONF_CHANGE_CHANNEL;
 
 	if ((changed & IEEE80211_CONF_CHANGE_IDLE) &&
 	    !(hw->conf.flags & IEEE80211_CONF_IDLE))

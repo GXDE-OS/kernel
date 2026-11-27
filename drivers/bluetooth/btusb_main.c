@@ -68,7 +68,6 @@ static struct usb_driver btusb_driver;
 #define BTUSB_INTEL_NO_WBS_SUPPORT	BIT(26)
 #define BTUSB_ACTIONS_SEMI		BIT(27)
 #define BTUSB_BARROT			BIT(28)
-#define BTUSB_BROKEN_EXT_SCAN		BIT(29)
 #define BTUSB_LOWER_LESCAN_INTERVAL	BIT(30)
 
 static const struct usb_device_id btusb_table[] = {

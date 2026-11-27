@@ -4536,6 +4536,11 @@ struct rtw89_ra_info {
 	u8 macid_msb:2;
 	u8 band:2; /* enum rtw89_band */
 	u8 is_new_dbgreg:1;
+
+	/* keep driver helpers below in group (not cleared by rtw89_phy_ra_sta_update()) */
+	struct_group(helpers,
+		bool rssi_unknown;
+	);
 };
 
 #define RTW89_PPDU_MAC_INFO_USR_SIZE 4
@@ -7555,6 +7560,7 @@ struct rtw89_dev {
 	const struct rtw89_io_ops *io;
 
 	bool dbcc_en;
+	bool support_chanctx;
 	bool support_mlo;
 	enum rtw89_mlo_dbcc_mode mlo_dbcc_mode;
 	struct rtw89_hw_scan_info scan_info;
