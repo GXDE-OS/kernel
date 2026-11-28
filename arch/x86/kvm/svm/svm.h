@@ -438,6 +438,10 @@ static __always_inline bool is_sev_snp_guest(struct kvm_vcpu *vcpu)
 	return ____sev_snp_guest(vcpu->kvm);
 }
 #else
+static __always_inline bool ____sev_es_guest(struct kvm *kvm)
+{
+	return false;
+}
 static __always_inline bool is_sev_guest(struct kvm_vcpu *vcpu)
 {
 	return false;
