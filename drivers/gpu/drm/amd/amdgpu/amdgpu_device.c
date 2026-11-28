@@ -2356,11 +2356,6 @@ static int amdgpu_device_fw_loading(struct amdgpu_device *adev)
 
 static int amdgpu_device_init_schedulers(struct amdgpu_device *adev)
 {
-	struct drm_sched_init_args args = {
-		.ops = &amdgpu_sched_ops,
-		.timeout_wq = adev->reset_domain->wq,
-		.dev = adev->dev,
-	};
 	long timeout;
 	int r, i;
 
@@ -2386,12 +2381,11 @@ static int amdgpu_device_init_schedulers(struct amdgpu_device *adev)
 			break;
 		}
 
-		args.hw_submission = ring->num_hw_submission;
-		args.timeout = timeout;
-		args.score = ring->sched_score;
-		args.name = ring->name;
-
-		r = drm_sched_init(&ring->sched, &args);
+		r = drm_sched_init(&ring->sched, &amdgpu_sched_ops,
+				   ring->num_hw_submission, 0,
+				   timeout, adev->reset_domain->wq,
+				   ring->sched_score, ring->name,
+				   adev->dev);
 		if (r) {
 			DRM_ERROR("Failed to create scheduler on ring %s.\n",
 				  ring->name);
@@ -4187,10 +4181,12 @@ void amdgpu_device_fini_sw(struct amdgpu_device *adev)
 	if ((adev->pdev->class >> 8) == PCI_CLASS_DISPLAY_VGA)
 		vga_client_unregister(adev->pdev);
 
-	if (drm_dev_enter(adev_to_drm(adev), &idx)) {
-
+	if (adev->rmmio) {
 		iounmap(adev->rmmio);
 		adev->rmmio = NULL;
+	}
+
+	if (drm_dev_enter(adev_to_drm(adev), &idx)) {
 		amdgpu_doorbell_fini(adev);
 		drm_dev_exit(idx);
 	}
@@ -4952,6 +4948,15 @@ int amdgpu_device_pre_asic_reset(struct amdgpu_device *adev,
 		if (kiq_ring->fence_drv.initialized && kiq_ring->sched.ready)
 			amdgpu_fence_driver_force_completion(kiq_ring);
 	}
+
+	/*
+	 * MES scheduler rings have no drm scheduler, so they are missed by the
+	 * loop above. Realign their polling fence too, otherwise the
+	 * first post-reset submission polls forever on a stale seq. sched.ready is
+	 * only set while the driver owns the ring.
+	 */
+	if (adev->mes.ring.fence_drv.initialized && adev->mes.ring.sched.ready)
+		amdgpu_fence_driver_force_completion(&adev->mes.ring);
 
 	amdgpu_fence_driver_isr_toggle(adev, false);
 
